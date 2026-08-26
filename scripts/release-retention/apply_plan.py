@@ -205,7 +205,7 @@ def run_command(rclone_bin: str, arguments: Sequence[str]) -> subprocess.Complet
   )
 
 
-def list_inventory(rclone_bin: str, remote: str) -> Dict[str, InventoryObject]:
+def list_inventory(rclone_bin: str, remote: str, prefix: str) -> Dict[str, InventoryObject]:
   result = run_command(rclone_bin, [
     "lsjson",
     "--recursive",
@@ -217,7 +217,11 @@ def list_inventory(rclone_bin: str, remote: str) -> Dict[str, InventoryObject]:
   if result.returncode != 0:
     raise ApplyError("rclone lsjson failed: {}".format((result.stderr or result.stdout).strip()))
   try:
-    return {item.key: item for item in parse_inventory_value(json.loads(result.stdout))}
+    return {
+      item.key: item
+      for item in parse_inventory_value(json.loads(result.stdout))
+      if item.key.startswith(prefix)
+    }
   except (ApplyError, ValueError, json.JSONDecodeError) as error:
     raise ApplyError("rclone lsjson returned an invalid inventory: {}".format(error)) from error
 
@@ -294,7 +298,7 @@ def apply_plan(
 
   remote = plan["rclone_remote"]
   try:
-    actual = list_inventory(rclone_bin, remote)
+    actual = list_inventory(rclone_bin, remote, plan["r2_prefix"])
     compare_inventory(keep, delete, actual)
   except ApplyError as error:
     result["status"] = "failed"
@@ -320,7 +324,7 @@ def apply_plan(
       statuses[index]["status"] = "deleted"
       continue
     try:
-      after_failure = list_inventory(rclone_bin, remote)
+      after_failure = list_inventory(rclone_bin, remote, plan["r2_prefix"])
     except ApplyError:
       statuses[index]["status"] = "failed"
       statuses[index]["error"] = (command_result.stderr or command_result.stdout).strip()
@@ -335,7 +339,7 @@ def apply_plan(
     return 1, result
 
   try:
-    final_inventory = list_inventory(rclone_bin, remote)
+    final_inventory = list_inventory(rclone_bin, remote, plan["r2_prefix"])
     compare_inventory(keep, {}, final_inventory)
   except ApplyError as error:
     result["status"] = "failed"

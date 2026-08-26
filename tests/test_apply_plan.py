@@ -126,6 +126,30 @@ class RetentionApplyTests(unittest.TestCase):
     self.assertEqual(run.call_count, 1)
     self.assertEqual(run.call_args.args[0][1], "lsjson")
 
+  def test_ignores_objects_from_other_products_in_a_shared_remote_root(self):
+    _, retention_plan, plan_path, _ = self.fixture()
+    objects = [
+      inventory_item("3.1.0", 10, "old"),
+      inventory_item("3.1.4", 20, "new"),
+      {"Path": "other-app/releases/9.0.0.zip", "Size": 1, "ModTime": "2026-08-25T00:00:00Z", "Hashes": {"MD5": "other"}},
+    ]
+    with patch("apply_plan.subprocess.run", side_effect=lambda args, **kwargs: CompletedProcess(
+      args=args,
+      returncode=0,
+      stdout=self.lsjson(objects) if args[1] == "lsjson" else "",
+      stderr="",
+    )) as run:
+      code = apply_plan.main([
+        "--plan", str(plan_path),
+        "--expected-plan-sha256", retention_plan["plan_id"],
+        "--product", "kindow",
+        "--rclone-remote", REMOTE,
+        "--r2-prefix", PREFIX,
+        "--now", "2026-08-26T00:00:00Z",
+      ])
+    self.assertEqual(code, 0)
+    self.assertEqual(run.call_count, 2)
+
   def test_without_execute_only_dry_runs_each_candidate_without_a_shell(self):
     _, retention_plan, plan_path, _ = self.fixture()
     objects = [inventory_item("3.1.0", 10, "old"), inventory_item("3.1.4", 20, "new")]

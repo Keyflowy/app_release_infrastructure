@@ -213,6 +213,32 @@ class ReleaseRetentionPlanTests(unittest.TestCase):
     self.assertEqual(decisions["unlisted/keep-me.bin"], ("keep", "unknown-object"))
     self.assertEqual(result["summary"]["unknown_count"], 1)
 
+  def test_ignores_objects_from_other_products_in_a_shared_remote_root(self):
+    release_item = release("3.2.7", "2026-08-01", delta_keys=[])
+    release_item["full_zip_object_key"] = "kindow/releases/3.2.7/app.zip"
+    manifest = {
+      "schema_version": 1,
+      "product": "kindow",
+      "generated_at": "2026-08-26T00:00:00Z",
+      "releases": [release_item],
+    }
+    inventory = [
+      "kindow/releases/3.2.7/app.zip",
+      "other-app/releases/9.0.0/app.zip",
+    ]
+    manifest_path, inventory_path = self.write_fixture(manifest, inventory)
+    result = plan.build_plan(
+      manifest_path,
+      POLICY,
+      inventory_path,
+      AS_OF,
+      "cf_r2:keyflowy-apps/",
+      "kindow/",
+    )
+    decisions = self.decisions(result)
+    self.assertEqual(decisions, {"kindow/releases/3.2.7/app.zip": ("keep", "recent-stable")})
+    self.assertEqual(result["summary"]["unknown_count"], 0)
+
   def test_output_is_sorted_and_text_rendering_is_reviewable(self):
     manifest = {
       "schema_version": 1,

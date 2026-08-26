@@ -37,7 +37,7 @@ The reusable workflow at `.github/workflows/reusable-retention-plan.yml` runs
 this planner from an App repository and uploads the deterministic plan as a
 workflow artifact. It is a planning workflow, not an apply workflow. Consumers
 should pin the shared workflow to a reviewed release tag once the repository's
-first release is published; `main` is used only during bootstrap.
+first release is published. Do not use a mutable branch for production callers.
 
 ## Running the planner
 
@@ -69,8 +69,10 @@ plan is reproducible. Omitting it uses the current UTC timestamp.
 
 For a complete plan bound to a product prefix, include the rclone remote root
 and prefix. The remote root is the path passed to `rclone lsjson`; object keys
-in the manifest and inventory are relative to that root and must start with
-the product prefix:
+in the manifest and inventory are relative to that root. Manifest keys must
+start with the product prefix. A complete inventory may include sibling product
+prefixes from the shared root; planning and apply fingerprint only the selected
+product prefix:
 
 ```sh
 python3 scripts/release-retention/plan.py \
@@ -87,8 +89,9 @@ python3 scripts/release-retention/plan.py \
 
 `scripts/release-retention/apply_plan.py` is the only deletion entry point. It
 always refreshes the remote with `rclone lsjson --recursive --files-only
---hash`, rejects new objects or changed fingerprints, and preserves every
-planned keep object. A missing delete candidate is treated as
+--hash`, rejects new objects or changed fingerprints within the approved
+product prefix, and preserves every planned keep object. Sibling product
+prefixes are outside the plan and ignored. A missing delete candidate is treated as
 `already-absent`, which makes an interrupted run safe to retry with the same
 plan. Any other delete failure stops immediately.
 

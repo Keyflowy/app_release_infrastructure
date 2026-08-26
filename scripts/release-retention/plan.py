@@ -284,6 +284,13 @@ def parse_inventory(path: Optional[Path], manifest_keys: Iterable[str]) -> List[
   return parse_inventory_value(load_json(path))
 
 
+def scope_inventory(inventory: Sequence[InventoryObject], prefix: Optional[str]) -> List[InventoryObject]:
+  """Keep only objects owned by this product when the remote root is shared."""
+  if prefix is None:
+    return list(inventory)
+  return [item for item in inventory if item.key.startswith(prefix)]
+
+
 def validate_storage(rclone_remote: str, allowed_prefix: str) -> None:
   if not isinstance(rclone_remote, str) or not re.fullmatch(r"[A-Za-z0-9._-]+:.+/", rclone_remote):
     raise ValueError("rclone_remote must look like remote:path/ and end in '/'")
@@ -495,9 +502,7 @@ def build_plan(
     invalid_manifest_keys = sorted(key for key in artifacts if not key.startswith(r2_prefix))
     if invalid_manifest_keys:
       raise ValueError("manifest object is outside r2_prefix: {}".format(invalid_manifest_keys[0]))
-    invalid_inventory_keys = sorted(item.key for item in inventory if not item.key.startswith(r2_prefix))
-    if invalid_inventory_keys:
-      raise ValueError("inventory object is outside r2_prefix: {}".format(invalid_inventory_keys[0]))
+    inventory = scope_inventory(inventory, r2_prefix)
   reference_time = as_of or datetime.now(UTC)
   if reference_time.tzinfo is None:
     reference_time = reference_time.replace(tzinfo=UTC)

@@ -32,9 +32,11 @@ present in a reviewed plan whose reason is an approved expiry rule. A plan is
 bound to a canonical SHA-256 `plan_id`, manifest/policy/inventory digests,
 expiry time, remote root, and product prefix. Before deletion, the apply
 command obtains a fresh `rclone lsjson --recursive --files-only --hash`
-inventory. New objects, missing keep objects, or changed size/modtime/hash/ID
-fingerprints fail closed. A missing delete candidate is the only tolerated
-drift and is recorded as `already-absent`.
+inventory. The inventory can cover a shared remote root, but the plan digest
+and drift checks are scoped to the product prefix. New objects, missing keep
+objects, or changed size/modtime/hash/ID fingerprints inside that prefix fail
+closed. Objects in sibling product prefixes are ignored. A missing delete
+candidate is the only tolerated drift and is recorded as `already-absent`.
 
 Protected metadata, explicit fallback releases, recent stable installers, and
 unknown objects are never deletion candidates. The apply command performs one
