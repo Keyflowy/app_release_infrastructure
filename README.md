@@ -27,9 +27,11 @@ The cutoff dates are inclusive. An object released exactly on a cutoff date is
 kept. A stable installer that is not notarized is kept for investigation and
 is never treated as a deletion candidate.
 
-The planner is intentionally dry-run only. It never invokes `rclone`, writes
-to R2, or deletes an object. A future apply step must consume its reviewed JSON
-plan and require an explicit, separately protected action.
+The planner is intentionally non-destructive. It never invokes `rclone`, writes
+to R2, or deletes an object. A plan includes a canonical `plan_id`, input file
+digests, an expiry timestamp, the complete inventory fingerprint, and the
+approved storage target. The separate apply command consumes only that exact
+reviewed plan.
 
 The reusable workflow at `.github/workflows/reusable-retention-plan.yml` runs
 this planner from an App repository and uploads the deterministic plan as a
@@ -64,6 +66,45 @@ form can be strings or objects with `key`/`object_key`:
 Use `--format text` for a review-friendly tab-separated report or `--output`
 to write the JSON/text report to a file. Pass `--as-of` in CI and tests so a
 plan is reproducible. Omitting it uses the current UTC timestamp.
+
+For a complete plan bound to a product prefix, include the rclone remote root
+and prefix. The remote root is the path passed to `rclone lsjson`; object keys
+in the manifest and inventory are relative to that root and must start with
+the product prefix:
+
+```sh
+python3 scripts/release-retention/plan.py \
+  --manifest release-manifest.json \
+  --policy config/release-retention.toml \
+  --inventory r2-inventory.json \
+  --rclone-remote cf_r2:keyflowy-apps/ \
+  --r2-prefix kindow/ \
+  --as-of 2026-08-26T00:00:00Z \
+  --output retention-plan.json
+```
+
+## Applying a reviewed plan
+
+`scripts/release-retention/apply_plan.py` is the only deletion entry point. It
+always refreshes the remote with `rclone lsjson --recursive --files-only
+--hash`, rejects new objects or changed fingerprints, and preserves every
+planned keep object. A missing delete candidate is treated as
+`already-absent`, which makes an interrupted run safe to retry with the same
+plan. Any other delete failure stops immediately.
+
+Without `--execute`, the command performs validation and one `rclone` dry-run
+per candidate. Real deletion requires all of `--execute`,
+`--approval-id`, `--plan-run-id`, and `--plan-artifact-id`, plus the expected
+plan digest. Delete reasons are allow-listed and per-run object/byte limits
+are enforced before the first remote call.
+
+The reusable `.github/workflows/reusable-retention-apply.yml` places the job
+behind the `release-retention-production` protected environment, serializes
+applications per product prefix, downloads the immutable reviewed artifact,
+and uploads `apply-result.json`. Product repositories should expose a separate
+`workflow_dispatch` caller for apply; scheduled and push workflows must only
+produce plans. Configure `RCLONE_CONFIG` as an environment/repository secret
+and require reviewers on the protected environment.
 
 ## Manifest shape
 

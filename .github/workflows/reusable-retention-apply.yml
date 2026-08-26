@@ -1,0 +1,153 @@
+name: Reusable Release Retention Apply
+
+on:
+  workflow_call:
+    inputs:
+      execute:
+        description: Must be true for an approved protected-environment run
+        required: true
+        type: boolean
+      plan_run_id:
+        description: Workflow run ID that produced the reviewed plan artifact
+        required: true
+        type: string
+      plan_artifact_id:
+        description: Immutable artifact ID recorded during review
+        required: true
+        type: string
+      expected_plan_sha256:
+        description: SHA-256 plan_id copied from the reviewed plan
+        required: true
+        type: string
+      approval_id:
+        description: Human approval/change identifier recorded in the audit log
+        required: true
+        type: string
+      product:
+        description: Product name bound to the reviewed plan
+        required: true
+        type: string
+      rclone_remote:
+        description: rclone remote root bound to the reviewed plan
+        required: true
+        type: string
+      r2_prefix:
+        description: Product object prefix bound to the reviewed plan
+        required: true
+        type: string
+      manifest:
+        description: Caller repository manifest path
+        required: true
+        type: string
+      policy:
+        description: Caller repository policy path
+        required: true
+        type: string
+      max_delete_objects:
+        description: Maximum approved object count for one apply
+        required: false
+        type: number
+        default: 100
+      max_delete_bytes:
+        description: Maximum approved bytes for one apply
+        required: false
+        type: number
+        default: 53687091200
+    secrets:
+      RCLONE_CONFIG:
+        description: Complete rclone configuration for the product remote
+        required: true
+
+jobs:
+  apply:
+    if: ${{ inputs.execute }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: release-retention-production
+    concurrency:
+      group: release-retention-${{ inputs.product }}-${{ inputs.r2_prefix }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: Check out caller repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Check out the exact shared workflow revision
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .release-infrastructure
+          persist-credentials: false
+
+      - name: Configure rclone
+        env:
+          RCLONE_CONFIG_CONTENT: ${{ secrets.RCLONE_CONFIG }}
+        run: |
+          set -euo pipefail
+          if ! command -v rclone >/dev/null 2>&1; then
+            echo "rclone is required on the retention apply runner." >&2
+            exit 1
+          fi
+          if [ -z "$RCLONE_CONFIG_CONTENT" ]; then
+            echo "RCLONE_CONFIG reusable-workflow secret is required." >&2
+            exit 1
+          fi
+          config_path="$RUNNER_TEMP/rclone.conf"
+          umask 077
+          printf '%s' "$RCLONE_CONFIG_CONTENT" > "$config_path"
+          echo "RCLONE_CONFIG=$config_path" >> "$GITHUB_ENV"
+
+      - name: Download the reviewed plan artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          artifact-ids: ${{ inputs.plan_artifact_id }}
+          path: ${{ runner.temp }}/approved-retention-plan
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.plan_run_id }}
+
+      - name: Apply reviewed retention plan
+        env:
+          PLAN_PATH: ${{ runner.temp }}/approved-retention-plan/retention-plan.json
+          EXPECTED_PLAN_SHA256: ${{ inputs.expected_plan_sha256 }}
+          PRODUCT: ${{ inputs.product }}
+          RCLONE_REMOTE: ${{ inputs.rclone_remote }}
+          R2_PREFIX: ${{ inputs.r2_prefix }}
+          APPROVAL_ID: ${{ inputs.approval_id }}
+          PLAN_RUN_ID: ${{ inputs.plan_run_id }}
+          PLAN_ARTIFACT_ID: ${{ inputs.plan_artifact_id }}
+          MANIFEST_PATH: ${{ inputs.manifest }}
+          POLICY_PATH: ${{ inputs.policy }}
+          MAX_DELETE_OBJECTS: ${{ inputs.max_delete_objects }}
+          MAX_DELETE_BYTES: ${{ inputs.max_delete_bytes }}
+        run: |
+          set -euo pipefail
+          test -f "$PLAN_PATH"
+          python3 .release-infrastructure/scripts/release-retention/apply_plan.py \
+            --plan "$PLAN_PATH" \
+            --expected-plan-sha256 "$EXPECTED_PLAN_SHA256" \
+            --product "$PRODUCT" \
+            --rclone-remote "$RCLONE_REMOTE" \
+            --r2-prefix "$R2_PREFIX" \
+            --approval-id "$APPROVAL_ID" \
+            --plan-run-id "$PLAN_RUN_ID" \
+            --plan-artifact-id "$PLAN_ARTIFACT_ID" \
+            --manifest "$MANIFEST_PATH" \
+            --policy "$POLICY_PATH" \
+            --max-delete-objects "$MAX_DELETE_OBJECTS" \
+            --max-delete-bytes "$MAX_DELETE_BYTES" \
+            --result-output "$RUNNER_TEMP/apply-result.json" \
+            --execute
+
+      - name: Upload apply audit result
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-retention-apply-result-${{ github.run_id }}
+          path: ${{ runner.temp }}/apply-result.json
+          if-no-files-found: error

@@ -21,6 +21,20 @@ on:
         required: false
         type: string
         default: ""
+      rclone_remote:
+        description: Optional rclone remote root, for example cf_r2:keyflowy-apps/
+        required: false
+        type: string
+        default: ""
+      r2_prefix:
+        description: Optional product object prefix, for example kindow/
+        required: false
+        type: string
+        default: ""
+    secrets:
+      RCLONE_CONFIG:
+        description: Complete rclone configuration for the product remote
+        required: false
 
 jobs:
   plan:
@@ -29,24 +43,75 @@ jobs:
       contents: read
     steps:
       - name: Checkout caller repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Checkout shared planner
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           repository: Keyflowy/app_release_infrastructure
           path: .release-infrastructure
-          # Consumers should pin this to a reviewed release tag after the first
-          # shared-infrastructure release. Main is used while the repository is
-          # being bootstrapped.
-          ref: main
+          # job.workflow_sha is the immutable commit that supplied this
+          # reusable workflow; do not resolve the planner from a mutable branch.
+          ref: ${{ job.workflow_sha }}
+
+      - name: Prepare complete R2 inventory
+        id: inventory
+        env:
+          INVENTORY_PATH: ${{ inputs.inventory }}
+          RCLONE_REMOTE: ${{ inputs.rclone_remote }}
+          R2_PREFIX: ${{ inputs.r2_prefix }}
+          RCLONE_CONFIG_CONTENT: ${{ secrets.RCLONE_CONFIG }}
+        run: |
+          set -euo pipefail
+
+          if [ -n "$INVENTORY_PATH" ]; then
+            if [ -z "$RCLONE_REMOTE" ] || [ -z "$R2_PREFIX" ]; then
+              echo "inventory requires both rclone_remote and r2_prefix." >&2
+              exit 1
+            fi
+            echo "path=$INVENTORY_PATH" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ -z "$RCLONE_REMOTE" ] && [ -z "$R2_PREFIX" ]; then
+            echo "complete=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ -z "$RCLONE_REMOTE" ] || [ -z "$R2_PREFIX" ]; then
+            echo "rclone_remote and r2_prefix must be provided together." >&2
+            exit 1
+          fi
+          if ! command -v rclone >/dev/null 2>&1; then
+            echo "rclone is required on the planning runner when an R2 target is configured." >&2
+            exit 1
+          fi
+          if [ -z "$RCLONE_CONFIG_CONTENT" ]; then
+            echo "RCLONE_CONFIG reusable-workflow secret is required for a live R2 inventory." >&2
+            exit 1
+          fi
+
+          config_path="$RUNNER_TEMP/rclone.conf"
+          umask 077
+          printf '%s' "$RCLONE_CONFIG_CONTENT" > "$config_path"
+          export RCLONE_CONFIG="$config_path"
+          inventory_path="$RUNNER_TEMP/release-retention-inventory.json"
+          rclone lsjson \
+            --recursive \
+            --files-only \
+            --hash \
+            --no-mimetype \
+            "$RCLONE_REMOTE" > "$inventory_path"
+          echo "path=$inventory_path" >> "$GITHUB_OUTPUT"
+          echo "complete=true" >> "$GITHUB_OUTPUT"
 
       - name: Build deterministic retention plan
         env:
           MANIFEST_PATH: ${{ inputs.manifest }}
           POLICY_PATH: ${{ inputs.policy }}
-          INVENTORY_PATH: ${{ inputs.inventory }}
+          INVENTORY_PATH: ${{ steps.inventory.outputs.path }}
           AS_OF: ${{ inputs.as_of }}
+          RCLONE_REMOTE: ${{ inputs.rclone_remote }}
+          R2_PREFIX: ${{ inputs.r2_prefix }}
         run: |
           set -euo pipefail
 
@@ -65,11 +130,15 @@ jobs:
             args+=(--as-of "$AS_OF")
           fi
 
+          if [ -n "$RCLONE_REMOTE" ]; then
+            args+=(--rclone-remote "$RCLONE_REMOTE" --r2-prefix "$R2_PREFIX")
+          fi
+
           python3 .release-infrastructure/scripts/release-retention/plan.py "${args[@]}"
           python3 -m json.tool retention-plan.json >/dev/null
 
       - name: Publish reviewed plan artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: release-retention-plan
           path: retention-plan.json

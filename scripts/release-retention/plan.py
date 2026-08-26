@@ -6,16 +6,19 @@ objects are kept so an incomplete manifest cannot cause an accidental delete.
 """
 
 import argparse
+import hashlib
 import json
 import re
 import sys
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 
 UTC = timezone.utc
+PLAN_CONTRACT_VERSION = 1
+PLANNER_VERSION = "1"
 SEMVER_RE = re.compile(
   r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
   r"(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?"
@@ -34,11 +37,50 @@ class Artifact:
   notarized: bool = False
 
 
+@dataclass(frozen=True)
+class InventoryObject:
+  key: str
+  size_bytes: Optional[int] = None
+  mod_time: Optional[str] = None
+  hashes: Tuple[Tuple[str, str], ...] = ()
+  object_id: Optional[str] = None
+
+  def as_dict(self) -> Dict[str, Any]:
+    value: Dict[str, Any] = {"key": self.key}
+    if self.size_bytes is not None:
+      value["size_bytes"] = self.size_bytes
+    if self.mod_time is not None:
+      value["mod_time"] = self.mod_time
+    if self.hashes:
+      value["hashes"] = dict(self.hashes)
+    if self.object_id is not None:
+      value["object_id"] = self.object_id
+    return value
+
+
 def load_json(path: Path) -> Any:
   try:
     return json.loads(path.read_text(encoding="utf-8"))
   except json.JSONDecodeError as error:
     raise ValueError("invalid JSON in {}: {}".format(path, error)) from error
+
+
+def sha256_bytes(value: bytes) -> str:
+  return hashlib.sha256(value).hexdigest()
+
+
+def sha256_file(path: Path) -> str:
+  return sha256_bytes(path.read_bytes())
+
+
+def canonical_sha256(value: Any) -> str:
+  encoded = json.dumps(
+    value,
+    sort_keys=True,
+    separators=(",", ":"),
+    ensure_ascii=True,
+  ).encode("utf-8")
+  return sha256_bytes(encoded)
 
 
 def _parse_simple_toml(path: Path) -> Dict[str, Any]:
@@ -151,29 +193,106 @@ def parse_semver(value: Any, label: str) -> Tuple[int, int, int, Optional[str]]:
 def require_key(value: Any, label: str) -> str:
   if not isinstance(value, str) or not value:
     raise ValueError("{} must be a non-empty object key".format(label))
+  if value.startswith("/") or "\\" in value or any(ord(character) < 32 or ord(character) == 127 for character in value):
+    raise ValueError("{} is not a safe relative object key".format(label))
+  parts = value.split("/")
+  if any(part in ("", ".", "..") for part in parts):
+    raise ValueError("{} is not a normalized object key".format(label))
   return value
 
 
-def parse_inventory(path: Optional[Path], manifest_keys: Iterable[str]) -> List[str]:
-  if path is None:
-    return sorted(set(manifest_keys))
-  raw = load_json(path)
+def _optional_non_negative_integer(value: Any, label: str) -> Optional[int]:
+  if value is None:
+    return None
+  if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+    raise ValueError("{} must be a non-negative integer".format(label))
+  return value
+
+
+def _optional_string(value: Any, label: str) -> Optional[str]:
+  if value is None:
+    return None
+  if not isinstance(value, str) or not value:
+    raise ValueError("{} must be a non-empty string".format(label))
+  return value
+
+
+def parse_inventory_value(raw: Any) -> List[InventoryObject]:
   if isinstance(raw, list):
     raw_objects = raw
   elif isinstance(raw, dict) and isinstance(raw.get("objects"), list):
     raw_objects = raw["objects"]
   else:
     raise ValueError("inventory must be an array or an object with an 'objects' array")
-  keys: Set[str] = set()
+
+  objects: Dict[str, InventoryObject] = {}
   for index, item in enumerate(raw_objects):
     if isinstance(item, str):
       key = item
+      size_bytes = None
+      mod_time = None
+      hashes: Tuple[Tuple[str, str], ...] = ()
+      object_id = None
     elif isinstance(item, dict):
-      key = item.get("key", item.get("object_key"))
+      if item.get("IsDir") is True:
+        raise ValueError("inventory object {} must describe a file".format(index))
+      key = item.get("key", item.get("object_key", item.get("Path")))
+      size_bytes = _optional_non_negative_integer(
+        item.get("size_bytes", item.get("Size")),
+        "inventory object {} size".format(index),
+      )
+      mod_time = _optional_string(
+        item.get("mod_time", item.get("ModTime")),
+        "inventory object {} modification time".format(index),
+      )
+      raw_hashes = item.get("hashes", item.get("Hashes", {}))
+      if raw_hashes is None:
+        raw_hashes = {}
+      if not isinstance(raw_hashes, dict):
+        raise ValueError("inventory object {} hashes must be an object".format(index))
+      normalized_hashes = []
+      for hash_name, hash_value in raw_hashes.items():
+        if not isinstance(hash_name, str) or not hash_name:
+          raise ValueError("inventory object {} hash name must be a string".format(index))
+        if not isinstance(hash_value, str) or not hash_value:
+          raise ValueError("inventory object {} hash value must be a string".format(index))
+        normalized_hashes.append((hash_name, hash_value))
+      hashes = tuple(sorted(normalized_hashes))
+      object_id = _optional_string(
+        item.get("object_id", item.get("ID")),
+        "inventory object {} ID".format(index),
+      )
     else:
       raise ValueError("inventory object {} must be a string or object".format(index))
-    keys.add(require_key(key, "inventory object {} key".format(index)))
-  return sorted(keys)
+
+    object_key = require_key(key, "inventory object {} key".format(index))
+    if object_key in objects:
+      raise ValueError("inventory contains duplicate object key {!r}".format(object_key))
+    objects[object_key] = InventoryObject(
+      key=object_key,
+      size_bytes=size_bytes,
+      mod_time=mod_time,
+      hashes=hashes,
+      object_id=object_id,
+    )
+  return [objects[key] for key in sorted(objects)]
+
+
+def parse_inventory(path: Optional[Path], manifest_keys: Iterable[str]) -> List[InventoryObject]:
+  if path is None:
+    return [InventoryObject(key=key) for key in sorted(set(manifest_keys))]
+  return parse_inventory_value(load_json(path))
+
+
+def validate_storage(rclone_remote: str, allowed_prefix: str) -> None:
+  if not isinstance(rclone_remote, str) or not re.fullmatch(r"[A-Za-z0-9._-]+:.+/", rclone_remote):
+    raise ValueError("rclone_remote must look like remote:path/ and end in '/'")
+  remote_path = rclone_remote.split(":", 1)[1]
+  if any(part in ("", ".", "..") for part in remote_path.rstrip("/").split("/")):
+    raise ValueError("rclone_remote must have a normalized path")
+  if not allowed_prefix.endswith("/"):
+    raise ValueError("allowed_prefix must end in '/'")
+  require_key(allowed_prefix[:-1], "allowed_prefix")
 
 
 def add_artifact(
@@ -198,7 +317,7 @@ def add_artifact(
   ))
 
 
-def load_manifest(path: Path) -> Tuple[Dict[str, List[Artifact]], List[str], str]:
+def load_manifest(path: Path) -> Tuple[Dict[str, List[Artifact]], str]:
   manifest = load_json(path)
   if not isinstance(manifest, dict):
     raise ValueError("manifest must be a JSON object")
@@ -333,15 +452,52 @@ def decide_descriptor(
   return "keep", "unknown-artifact"
 
 
+def inventory_entry(item: InventoryObject, kind: str, reason: str) -> Dict[str, Any]:
+  entry: Dict[str, Any] = {
+    "key": item.key,
+    "kind": kind,
+    "reason": reason,
+  }
+  if item.size_bytes is not None:
+    entry["size_bytes"] = item.size_bytes
+  if item.mod_time is not None:
+    entry["mod_time"] = item.mod_time
+  if item.hashes:
+    entry["hashes"] = dict(item.hashes)
+  if item.object_id is not None:
+    entry["object_id"] = item.object_id
+  return entry
+
+
+def inventory_digest(inventory: Sequence[InventoryObject]) -> str:
+  return canonical_sha256([item.as_dict() for item in inventory])
+
+
 def build_plan(
   manifest_path: Path,
   policy_path: Path,
   inventory_path: Optional[Path] = None,
   as_of: Optional[datetime] = None,
+  rclone_remote: Optional[str] = None,
+  r2_prefix: Optional[str] = None,
+  plan_ttl_hours: int = 24,
 ) -> Dict[str, Any]:
+  if plan_ttl_hours <= 0:
+    raise ValueError("plan_ttl_hours must be positive")
+  if (rclone_remote is None) != (r2_prefix is None):
+    raise ValueError("rclone_remote and r2_prefix must be provided together")
+  if rclone_remote is not None and r2_prefix is not None:
+    validate_storage(rclone_remote, r2_prefix)
   policy = load_policy(policy_path)
   artifacts, product = load_manifest(manifest_path)
   inventory = parse_inventory(inventory_path, artifacts.keys())
+  if r2_prefix is not None:
+    invalid_manifest_keys = sorted(key for key in artifacts if not key.startswith(r2_prefix))
+    if invalid_manifest_keys:
+      raise ValueError("manifest object is outside r2_prefix: {}".format(invalid_manifest_keys[0]))
+    invalid_inventory_keys = sorted(item.key for item in inventory if not item.key.startswith(r2_prefix))
+    if invalid_inventory_keys:
+      raise ValueError("inventory object is outside r2_prefix: {}".format(invalid_inventory_keys[0]))
   reference_time = as_of or datetime.now(UTC)
   if reference_time.tzinfo is None:
     reference_time = reference_time.replace(tzinfo=UTC)
@@ -352,14 +508,14 @@ def build_plan(
   prerelease_cutoff = reference_date - timedelta(days=policy["retain_prereleases_days"])
   latest_stable = choose_latest_stable(artifacts)
 
-  keep: List[Dict[str, str]] = []
-  delete: List[Dict[str, str]] = []
+  keep: List[Dict[str, Any]] = []
+  delete: List[Dict[str, Any]] = []
   unknown_count = 0
-  for key in inventory:
-    descriptors = artifacts.get(key)
+  for item in inventory:
+    descriptors = artifacts.get(item.key)
     if descriptors is None:
       unknown_count += 1
-      keep.append({"key": key, "kind": "unknown", "reason": "unknown-object"})
+      keep.append(inventory_entry(item, "unknown", "unknown-object"))
       continue
     decisions = [
       decide_descriptor(
@@ -379,15 +535,24 @@ def build_plan(
         (reason for _, reason in keep_decisions if reason in ("fallback-release", "protected-metadata")),
         keep_decisions[0][1],
       )
-      keep.append({"key": key, "kind": kind, "reason": reason})
+      keep.append(inventory_entry(item, kind, reason))
     else:
-      delete.append({"key": key, "kind": kind, "reason": decisions[0][1]})
+      delete.append(inventory_entry(item, kind, decisions[0][1]))
 
   keep.sort(key=lambda item: item["key"])
   delete.sort(key=lambda item: item["key"])
-  return {
+  payload: Dict[str, Any] = {
+    "contract_version": PLAN_CONTRACT_VERSION,
+    "planner_version": PLANNER_VERSION,
     "product": product,
+    "rclone_remote": rclone_remote,
+    "r2_prefix": r2_prefix,
     "as_of": reference_time.isoformat().replace("+00:00", "Z"),
+    "expires_at": (reference_time + timedelta(hours=plan_ttl_hours)).isoformat().replace("+00:00", "Z"),
+    "inventory_complete": inventory_path is not None,
+    "manifest_sha256": sha256_file(manifest_path),
+    "policy_sha256": sha256_file(policy_path),
+    "inventory_sha256": inventory_digest(inventory),
     "cutoffs": {
       "recent_stable": recent_cutoff.isoformat(),
       "sparkle_delta": delta_cutoff.isoformat(),
@@ -399,8 +564,11 @@ def build_plan(
       "keep_count": len(keep),
       "delete_count": len(delete),
       "unknown_count": unknown_count,
+      "delete_bytes": sum(item.get("size_bytes", 0) for item in delete),
     },
   }
+  payload["plan_id"] = canonical_sha256(payload)
+  return payload
 
 
 def render_text(plan: Dict[str, Any]) -> str:
@@ -431,6 +599,14 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
   parser.add_argument("--as-of", help="UTC ISO timestamp for deterministic planning")
   parser.add_argument("--format", choices=("json", "text"), default="json")
   parser.add_argument("--output", type=Path, help="write the plan to this file")
+  parser.add_argument("--rclone-remote", help="rclone remote root used by the apply step, for example cf_r2:keyflowy-apps/")
+  parser.add_argument("--r2-prefix", help="complete object prefix, including trailing slash")
+  parser.add_argument(
+    "--plan-ttl-hours",
+    type=int,
+    default=24,
+    help="hours after as-of during which a plan may be applied",
+  )
   return parser.parse_args(argv)
 
 
@@ -442,6 +618,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
       args.policy,
       args.inventory,
       parse_as_of(args.as_of),
+      args.rclone_remote,
+      args.r2_prefix,
+      args.plan_ttl_hours,
     )
     rendered = render_text(plan) if args.format == "text" else json.dumps(plan, indent=2) + "\n"
     if args.output is None:

@@ -1,0 +1,83 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/Keyflowy/app_release_infrastructure/releases/retention-plan.schema.json",
+  "title": "Release retention plan",
+  "description": "Deterministic keep/delete decisions. Apply additionally requires complete inventory fingerprints.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "contract_version",
+    "planner_version",
+    "product",
+    "rclone_remote",
+    "r2_prefix",
+    "as_of",
+    "expires_at",
+    "inventory_complete",
+    "manifest_sha256",
+    "policy_sha256",
+    "inventory_sha256",
+    "cutoffs",
+    "keep",
+    "delete",
+    "summary",
+    "plan_id"
+  ],
+  "properties": {
+    "contract_version": { "const": 1 },
+    "planner_version": { "type": "string", "minLength": 1 },
+    "product": { "type": "string", "minLength": 1 },
+    "rclone_remote": { "type": ["string", "null"] },
+    "r2_prefix": { "type": ["string", "null"] },
+    "as_of": { "type": "string", "format": "date-time" },
+    "expires_at": { "type": "string", "format": "date-time" },
+    "inventory_complete": { "type": "boolean" },
+    "manifest_sha256": { "$ref": "#/$defs/sha256" },
+    "policy_sha256": { "$ref": "#/$defs/sha256" },
+    "inventory_sha256": { "$ref": "#/$defs/sha256" },
+    "cutoffs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["recent_stable", "sparkle_delta", "prerelease"],
+      "properties": {
+        "recent_stable": { "type": "string", "format": "date" },
+        "sparkle_delta": { "type": "string", "format": "date" },
+        "prerelease": { "type": "string", "format": "date" }
+      }
+    },
+    "keep": { "type": "array", "items": { "$ref": "#/$defs/entry" } },
+    "delete": { "type": "array", "items": { "$ref": "#/$defs/entry" } },
+    "summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["keep_count", "delete_count", "unknown_count", "delete_bytes"],
+      "properties": {
+        "keep_count": { "type": "integer", "minimum": 0 },
+        "delete_count": { "type": "integer", "minimum": 0 },
+        "unknown_count": { "type": "integer", "minimum": 0 },
+        "delete_bytes": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "plan_id": { "$ref": "#/$defs/sha256" }
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "entry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["key", "kind", "reason"],
+      "properties": {
+        "key": { "type": "string", "minLength": 1 },
+        "kind": { "type": "string", "minLength": 1 },
+        "reason": { "type": "string", "minLength": 1 },
+        "size_bytes": { "type": "integer", "minimum": 0 },
+        "mod_time": { "type": "string", "minLength": 1 },
+        "hashes": { "type": "object", "additionalProperties": { "type": "string", "minLength": 1 } },
+        "object_id": { "type": "string", "minLength": 1 }
+      }
+    }
+  }
+}
