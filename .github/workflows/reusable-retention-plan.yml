@@ -1,0 +1,76 @@
+name: Reusable Release Retention Plan
+
+on:
+  workflow_call:
+    inputs:
+      manifest:
+        description: Path to the caller repository's release manifest
+        required: true
+        type: string
+      policy:
+        description: Path to the caller repository's retention policy
+        required: true
+        type: string
+      inventory:
+        description: Optional JSON inventory of the product's R2 objects
+        required: false
+        type: string
+        default: ""
+      as_of:
+        description: Optional UTC timestamp used for a reproducible plan
+        required: false
+        type: string
+        default: ""
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout caller repository
+        uses: actions/checkout@v6
+
+      - name: Checkout shared planner
+        uses: actions/checkout@v6
+        with:
+          repository: Keyflowy/app_release_infrastructure
+          path: .release-infrastructure
+          # Consumers should pin this to a reviewed release tag after the first
+          # shared-infrastructure release. Main is used while the repository is
+          # being bootstrapped.
+          ref: main
+
+      - name: Build deterministic retention plan
+        env:
+          MANIFEST_PATH: ${{ inputs.manifest }}
+          POLICY_PATH: ${{ inputs.policy }}
+          INVENTORY_PATH: ${{ inputs.inventory }}
+          AS_OF: ${{ inputs.as_of }}
+        run: |
+          set -euo pipefail
+
+          args=(
+            --manifest "$MANIFEST_PATH"
+            --policy "$POLICY_PATH"
+            --format json
+            --output retention-plan.json
+          )
+
+          if [ -n "$INVENTORY_PATH" ]; then
+            args+=(--inventory "$INVENTORY_PATH")
+          fi
+
+          if [ -n "$AS_OF" ]; then
+            args+=(--as-of "$AS_OF")
+          fi
+
+          python3 .release-infrastructure/scripts/release-retention/plan.py "${args[@]}"
+          python3 -m json.tool retention-plan.json >/dev/null
+
+      - name: Publish reviewed plan artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-retention-plan
+          path: retention-plan.json
+          if-no-files-found: error

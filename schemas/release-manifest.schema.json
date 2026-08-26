@@ -1,0 +1,114 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/Keyflowy/app_release_infrastructure/releases/release-manifest.schema.json",
+  "title": "Release manifest",
+  "description": "The immutable inventory used by release retention. The planner never infers release semantics from R2 object names.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "product",
+    "generated_at",
+    "releases"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "product": {
+      "type": "string",
+      "minLength": 1
+    },
+    "generated_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "appcast_object_key": {
+      "type": "string",
+      "minLength": 1
+    },
+    "protected_object_keys": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/objectKey"
+      },
+      "uniqueItems": true
+    },
+    "releases": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/release"
+      }
+    }
+  },
+  "$defs": {
+    "objectKey": {
+      "type": "string",
+      "minLength": 1
+    },
+    "release": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "version",
+        "feature_line",
+        "release_date",
+        "channel",
+        "notarization_status",
+        "full_zip_object_key",
+        "sparkle_delta_object_keys"
+      ],
+      "properties": {
+        "version": {
+          "type": "string",
+          "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?(\\+[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?$"
+        },
+        "feature_line": {
+          "type": "string",
+          "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$"
+        },
+        "release_date": {
+          "type": "string",
+          "format": "date"
+        },
+        "channel": {
+          "enum": [
+            "stable",
+            "prerelease"
+          ]
+        },
+        "notarization_status": {
+          "enum": [
+            "notarized",
+            "pending",
+            "failed"
+          ]
+        },
+        "fallback": {
+          "type": "boolean",
+          "default": false
+        },
+        "full_zip_object_key": {
+          "$ref": "#/$defs/objectKey"
+        },
+        "checksum": {
+          "type": "string",
+          "minLength": 1
+        },
+        "checksum_object_key": {
+          "$ref": "#/$defs/objectKey"
+        },
+        "signature_object_key": {
+          "$ref": "#/$defs/objectKey"
+        },
+        "sparkle_delta_object_keys": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/objectKey"
+          },
+          "uniqueItems": true
+        }
+      }
+    }
+  }
+}

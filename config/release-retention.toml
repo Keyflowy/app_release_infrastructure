@@ -1,0 +1,10 @@
+# Versioned policy for the release-retention planner.
+#
+# Dates are interpreted as UTC calendar dates. The recent window is inclusive:
+# a release on the cutoff date is still recent and is retained.
+policy_version = 1
+recent_stable_days = 730
+fallback_strategy = "latest-stable-patch-per-feature-line"
+retain_sparkle_deltas_days = 90
+retain_prereleases_days = 30
+unknown_objects = "keep"
