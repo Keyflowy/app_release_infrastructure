@@ -54,6 +54,16 @@ jobs:
           # reusable workflow; do not resolve the planner from a mutable branch.
           ref: ${{ job.workflow_sha }}
 
+      - name: Install rclone for live inventory
+        if: ${{ inputs.inventory == '' && inputs.rclone_remote != '' }}
+        run: |
+          set -euo pipefail
+          if command -v rclone >/dev/null 2>&1; then
+            exit 0
+          fi
+          sudo apt-get update
+          sudo apt-get install --yes rclone
+
       - name: Prepare complete R2 inventory
         id: inventory
         env:

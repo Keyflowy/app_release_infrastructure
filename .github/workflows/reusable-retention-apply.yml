@@ -84,6 +84,15 @@ jobs:
           path: .release-infrastructure
           persist-credentials: false
 
+      - name: Install rclone
+        run: |
+          set -euo pipefail
+          if command -v rclone >/dev/null 2>&1; then
+            exit 0
+          fi
+          sudo apt-get update
+          sudo apt-get install --yes rclone
+
       - name: Configure rclone
         env:
           RCLONE_CONFIG_CONTENT: ${{ secrets.RCLONE_CONFIG }}
