@@ -2,6 +2,13 @@ name: Reusable Release Retention Plan
 
 on:
   workflow_call:
+    outputs:
+      plan_artifact_id:
+        description: Immutable artifact ID for the generated retention plan
+        value: ${{ jobs.plan.outputs.plan_artifact_id }}
+      plan_sha256:
+        description: SHA-256 digest of retention-plan.json
+        value: ${{ jobs.plan.outputs.plan_sha256 }}
     inputs:
       manifest:
         description: Path to the caller repository's release manifest
