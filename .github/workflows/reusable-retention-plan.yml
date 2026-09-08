@@ -2,6 +2,13 @@ name: Reusable Release Retention Plan
 
 on:
   workflow_call:
+    outputs:
+      plan_artifact_id:
+        description: Immutable artifact ID for the generated retention plan
+        value: ${{ jobs.plan.outputs.plan_artifact_id }}
+      plan_sha256:
+        description: SHA-256 digest of retention-plan.json
+        value: ${{ jobs.plan.outputs.plan_sha256 }}
     inputs:
       manifest:
         description: Path to the caller repository's release manifest
@@ -31,11 +38,6 @@ on:
         required: false
         type: string
         default: ""
-      runs_on:
-        description: JSON array of runner labels, or a single runner label
-        required: false
-        type: string
-        default: ubuntu-latest
     secrets:
       RCLONE_CONFIG:
         description: Complete rclone configuration for the product remote
@@ -43,7 +45,10 @@ on:
 
 jobs:
   plan:
-    runs-on: ${{ startsWith(inputs.runs_on, '[') && fromJSON(inputs.runs_on) || inputs.runs_on }}
+    outputs:
+      plan_artifact_id: ${{ steps.publish.outputs.artifact-id }}
+      plan_sha256: ${{ steps.digest.outputs.sha256 }}
+    runs-on: ubuntu-latest
     permissions:
       contents: read
     steps:
@@ -153,8 +158,15 @@ jobs:
           python3 -m json.tool retention-plan.json >/dev/null
 
       - name: Publish reviewed plan artifact
+        id: publish
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: release-retention-plan
           path: retention-plan.json
           if-no-files-found: error
+
+      - name: Compute plan digest
+        id: digest
+        run: |
+          set -euo pipefail
+          echo "sha256=$(sha256sum retention-plan.json | awk '{print $1}')" >> "$GITHUB_OUTPUT"
