@@ -31,6 +31,11 @@ on:
         required: false
         type: string
         default: ""
+      runs_on:
+        description: JSON array of runner labels, or a single runner label
+        required: false
+        type: string
+        default: ubuntu-latest
     secrets:
       RCLONE_CONFIG:
         description: Complete rclone configuration for the product remote
@@ -38,7 +43,7 @@ on:
 
 jobs:
   plan:
-    runs-on: ubuntu-latest
+    runs-on: ${{ startsWith(inputs.runs_on, '[') && fromJSON(inputs.runs_on) || inputs.runs_on }}
     permissions:
       contents: read
     steps:
