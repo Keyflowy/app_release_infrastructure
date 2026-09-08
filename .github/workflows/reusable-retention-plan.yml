@@ -174,4 +174,4 @@ jobs:
         id: digest
         run: |
           set -euo pipefail
-          echo "sha256=$(sha256sum retention-plan.json | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+          echo "sha256=$(python3 -c 'import json; print(json.load(open("retention-plan.json"))["plan_id"])')" >> "$GITHUB_OUTPUT"
