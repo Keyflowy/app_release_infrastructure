@@ -53,6 +53,11 @@ on:
         required: false
         type: number
         default: 53687091200
+      runs_on:
+        description: JSON array of runner labels, or a single runner label
+        required: false
+        type: string
+        default: ubuntu-latest
     secrets:
       RCLONE_CONFIG:
         description: Complete rclone configuration for the product remote
@@ -61,7 +66,7 @@ on:
 jobs:
   apply:
     if: ${{ inputs.execute }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ startsWith(inputs.runs_on, '[') && fromJSON(inputs.runs_on) || inputs.runs_on }}
     timeout-minutes: 30
     environment: release-retention-production
     concurrency:
