@@ -39,14 +39,10 @@ on:
         type: string
         default: ""
       runs_on:
-        description: JSON array of runner labels, or a single runner label
+        description: JSON array of runner labels, or a single runner label; retention runs on a fixed self-hosted Linux home runner whose rclone configuration is runner-local
         required: false
         type: string
-        default: "[\"ubuntu-latest\"]"
-    secrets:
-      RCLONE_CONFIG:
-        description: Complete rclone configuration for the product remote
-        required: false
+        default: "[\"self-hosted\",\"Linux\",\"home\"]"
 
 jobs:
   plan:
@@ -69,15 +65,31 @@ jobs:
           # reusable workflow; do not resolve the planner from a mutable branch.
           ref: ${{ job.workflow_sha }}
 
-      - name: Install rclone for live inventory
+      - name: Validate runner-local rclone configuration
         if: ${{ inputs.inventory == '' && inputs.rclone_remote != '' }}
+        env:
+          RCLONE_REMOTE: ${{ inputs.rclone_remote }}
         run: |
           set -euo pipefail
-          if command -v rclone >/dev/null 2>&1; then
-            exit 0
+          if [[ "${RUNNER_ENVIRONMENT:-}" != "self-hosted" ]] || [[ "${RUNNER_OS:-}" != "Linux" ]]; then
+            echo "retention planning requires the fixed self-hosted Linux home runner." >&2
+            exit 1
           fi
-          sudo apt-get update
-          sudo apt-get install --yes rclone
+          if ! command -v rclone >/dev/null 2>&1; then
+            echo "rclone is not installed on the fixed self-hosted runner." >&2
+            exit 1
+          fi
+          remotes="$(rclone listremotes)"
+          for remote in "cf_r2:" "gd_admin:"; do
+            if ! printf '%s\n' "$remotes" | grep -Fxq "$remote"; then
+              echo "runner-local rclone configuration is missing the $remote remote." >&2
+              exit 1
+            fi
+          done
+          if ! rclone lsd "$RCLONE_REMOTE" >/dev/null 2>&1; then
+            echo "storage target $RCLONE_REMOTE is not accessible from the configured runner." >&2
+            exit 1
+          fi
 
       - name: Prepare complete R2 inventory
         id: inventory
@@ -85,7 +97,6 @@ jobs:
           INVENTORY_PATH: ${{ inputs.inventory }}
           RCLONE_REMOTE: ${{ inputs.rclone_remote }}
           R2_PREFIX: ${{ inputs.r2_prefix }}
-          RCLONE_CONFIG_CONTENT: ${{ secrets.RCLONE_CONFIG }}
         run: |
           set -euo pipefail
 
@@ -110,15 +121,7 @@ jobs:
             echo "rclone is required on the planning runner when an R2 target is configured." >&2
             exit 1
           fi
-          if [ -z "$RCLONE_CONFIG_CONTENT" ]; then
-            echo "RCLONE_CONFIG reusable-workflow secret is required for a live R2 inventory." >&2
-            exit 1
-          fi
 
-          config_path="$RUNNER_TEMP/rclone.conf"
-          umask 077
-          printf '%s' "$RCLONE_CONFIG_CONTENT" > "$config_path"
-          export RCLONE_CONFIG="$config_path"
           inventory_path="$RUNNER_TEMP/release-retention-inventory.json"
           rclone lsjson \
             --recursive \
