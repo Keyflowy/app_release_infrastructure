@@ -35,9 +35,12 @@ reviewed plan.
 
 The reusable workflow at `.github/workflows/reusable-retention-plan.yml` runs
 this planner from an App repository and uploads the deterministic plan as a
-workflow artifact. It is a planning workflow, not an apply workflow. Consumers
-should pin the shared workflow to a reviewed release tag once the repository's
-first release is published. Do not use a mutable branch for production callers.
+workflow artifact. A live R2 inventory is gathered on the fixed self-hosted
+Linux home runner with its runner-local rclone configuration; the workflow
+never receives rclone credentials as a secret. It is a planning workflow, not
+an apply workflow. Consumers should pin the shared workflow to a reviewed
+release tag once the repository's first release is published. Do not use a
+mutable branch for production callers.
 
 ## Running the planner
 
@@ -106,8 +109,14 @@ behind the `release-retention-production` protected environment, serializes
 applications per product prefix, downloads the immutable reviewed artifact,
 and uploads `apply-result.json`. Product repositories should expose a separate
 `workflow_dispatch` caller for apply; scheduled and push workflows must only
-produce plans. Configure `RCLONE_CONFIG` as an environment/repository secret
-and require reviewers on the protected environment.
+produce plans.
+
+Both reusable workflows run on a fixed self-hosted Linux home runner whose
+runner-local rclone configuration holds the `cf_r2:` and `gd_admin:` remotes;
+there is no `RCLONE_CONFIG` secret. Each workflow fails closed when the runner
+is not self-hosted Linux, when rclone or either remote is missing from the
+runner-local configuration, or when the plan's storage target is not
+accessible from that runner. Require reviewers on the protected environment.
 
 ## Manifest shape
 

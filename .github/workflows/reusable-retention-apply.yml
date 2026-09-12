@@ -53,15 +53,16 @@ on:
         required: false
         type: number
         default: 53687091200
-    secrets:
-      RCLONE_CONFIG:
-        description: Complete rclone configuration for the product remote
-        required: true
+      runs_on:
+        description: JSON array of runner labels, or a single runner label; retention runs on a fixed self-hosted Linux home runner whose rclone configuration is runner-local
+        required: false
+        type: string
+        default: "[\"self-hosted\",\"Linux\",\"home\"]"
 
 jobs:
   apply:
     if: ${{ inputs.execute }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(inputs.runs_on) }}
     timeout-minutes: 30
     environment: release-retention-production
     concurrency:
@@ -84,32 +85,30 @@ jobs:
           path: .release-infrastructure
           persist-credentials: false
 
-      - name: Install rclone
-        run: |
-          set -euo pipefail
-          if command -v rclone >/dev/null 2>&1; then
-            exit 0
-          fi
-          sudo apt-get update
-          sudo apt-get install --yes rclone
-
-      - name: Configure rclone
+      - name: Validate runner-local rclone configuration
         env:
-          RCLONE_CONFIG_CONTENT: ${{ secrets.RCLONE_CONFIG }}
+          RCLONE_REMOTE: ${{ inputs.rclone_remote }}
         run: |
           set -euo pipefail
+          if [[ "${RUNNER_ENVIRONMENT:-}" != "self-hosted" ]] || [[ "${RUNNER_OS:-}" != "Linux" ]]; then
+            echo "retention apply requires the fixed self-hosted Linux home runner." >&2
+            exit 1
+          fi
           if ! command -v rclone >/dev/null 2>&1; then
-            echo "rclone is required on the retention apply runner." >&2
+            echo "rclone is not installed on the fixed self-hosted runner." >&2
             exit 1
           fi
-          if [ -z "$RCLONE_CONFIG_CONTENT" ]; then
-            echo "RCLONE_CONFIG reusable-workflow secret is required." >&2
+          remotes="$(rclone listremotes)"
+          for remote in "cf_r2:" "gd_admin:"; do
+            if ! printf '%s\n' "$remotes" | grep -Fxq "$remote"; then
+              echo "runner-local rclone configuration is missing the $remote remote." >&2
+              exit 1
+            fi
+          done
+          if ! rclone lsd "$RCLONE_REMOTE" >/dev/null 2>&1; then
+            echo "storage target $RCLONE_REMOTE is not accessible from the configured runner." >&2
             exit 1
           fi
-          config_path="$RUNNER_TEMP/rclone.conf"
-          umask 077
-          printf '%s' "$RCLONE_CONFIG_CONTENT" > "$config_path"
-          echo "RCLONE_CONFIG=$config_path" >> "$GITHUB_ENV"
 
       - name: Download the reviewed plan artifact
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
