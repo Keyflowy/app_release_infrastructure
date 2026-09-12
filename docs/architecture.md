@@ -26,6 +26,11 @@ An App calls the reusable workflow with its product name, policy path, manifest
 path, and R2 prefix. The workflow passes the manifest to
 `scripts/release-retention/plan.py`. The planner is deterministic with an
 explicit `--as-of`, defaults to dry-run, and never invokes `rclone`.
+Before it makes a decision, the planner enforces the closed manifest schema,
+including unknown-field rejection, required fields, types, formats, and unique
+object-key arrays. Invalid or misspelled safety metadata therefore stops the
+plan. The apply workflow validates a supplied manifest through the same parser
+before checking its digest against the approved plan.
 
 The apply workflow is a separate protected action. It may delete only objects
 present in a reviewed plan whose reason is an approved expiry rule. A plan is

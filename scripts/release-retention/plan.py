@@ -13,7 +13,7 @@ import sys
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, FrozenSet, Iterable, List, Optional, Sequence, Tuple
 
 
 UTC = timezone.utc
@@ -24,6 +24,47 @@ SEMVER_RE = re.compile(
   r"(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?"
   r"(?:\+([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$"
 )
+DATE_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$")
+MANIFEST_TIMESTAMP_RE = re.compile(
+  r"^[0-9]{4}-[0-9]{2}-[0-9]{2}[Tt][0-9]{2}:[0-9]{2}:[0-9]{2}"
+  r"(?:\.[0-9]+)?(?:[Zz]|[+-][0-9]{2}:[0-9]{2})$"
+)
+MANIFEST_FIELDS = frozenset({
+  "schema_version",
+  "product",
+  "generated_at",
+  "appcast_object_key",
+  "protected_object_keys",
+  "releases",
+})
+REQUIRED_MANIFEST_FIELDS = frozenset({
+  "schema_version",
+  "product",
+  "generated_at",
+  "releases",
+})
+RELEASE_FIELDS = frozenset({
+  "version",
+  "feature_line",
+  "release_date",
+  "channel",
+  "notarization_status",
+  "fallback",
+  "full_zip_object_key",
+  "checksum",
+  "checksum_object_key",
+  "signature_object_key",
+  "sparkle_delta_object_keys",
+})
+REQUIRED_RELEASE_FIELDS = frozenset({
+  "version",
+  "feature_line",
+  "release_date",
+  "channel",
+  "notarization_status",
+  "full_zip_object_key",
+  "sparkle_delta_object_keys",
+})
 
 
 @dataclass(frozen=True)
@@ -160,7 +201,7 @@ def load_policy(path: Path) -> Dict[str, Any]:
 
 
 def parse_release_date(value: Any, label: str) -> date:
-  if not isinstance(value, str):
+  if not isinstance(value, str) or DATE_RE.fullmatch(value) is None:
     raise ValueError("{} must be an ISO date".format(label))
   try:
     return date.fromisoformat(value)
@@ -199,6 +240,33 @@ def require_key(value: Any, label: str) -> str:
   if any(part in ("", ".", "..") for part in parts):
     raise ValueError("{} is not a normalized object key".format(label))
   return value
+
+
+def reject_unknown_fields(value: Dict[str, Any], allowed: FrozenSet[str], label: str) -> None:
+  unknown = sorted(set(value) - allowed)
+  if unknown:
+    raise ValueError("{} has unknown field {!r}".format(label, unknown[0]))
+
+
+def require_fields(value: Dict[str, Any], required: FrozenSet[str], label: str) -> None:
+  missing = sorted(required - set(value))
+  if missing:
+    raise ValueError("{} is missing required field {!r}".format(label, missing[0]))
+
+
+def require_unique(values: Sequence[str], label: str) -> None:
+  if len(values) != len(set(values)):
+    raise ValueError("{} must contain unique values".format(label))
+
+
+def validate_manifest_timestamp(value: Any) -> None:
+  if not isinstance(value, str) or MANIFEST_TIMESTAMP_RE.fullmatch(value) is None:
+    raise ValueError("manifest generated_at must be an ISO date-time with a timezone")
+  normalized = value[:-1] + "+00:00" if value[-1] in ("Z", "z") else value
+  try:
+    datetime.fromisoformat(normalized)
+  except ValueError as error:
+    raise ValueError("manifest generated_at must be an ISO date-time with a timezone") from error
 
 
 def _optional_non_negative_integer(value: Any, label: str) -> Optional[int]:
@@ -328,19 +396,15 @@ def load_manifest(path: Path) -> Tuple[Dict[str, List[Artifact]], str]:
   manifest = load_json(path)
   if not isinstance(manifest, dict):
     raise ValueError("manifest must be a JSON object")
-  if manifest.get("schema_version") != 1:
+  reject_unknown_fields(manifest, MANIFEST_FIELDS, "manifest")
+  require_fields(manifest, REQUIRED_MANIFEST_FIELDS, "manifest")
+  if type(manifest["schema_version"]) is not int or manifest["schema_version"] != 1:
     raise ValueError("manifest schema_version must be 1")
-  product = manifest.get("product")
+  product = manifest["product"]
   if not isinstance(product, str) or not product:
     raise ValueError("manifest product must be a non-empty string")
-  generated_at = manifest.get("generated_at")
-  if not isinstance(generated_at, str) or not generated_at:
-    raise ValueError("manifest generated_at must be a non-empty ISO timestamp")
-  try:
-    parse_as_of(generated_at)
-  except ValueError as error:
-    raise ValueError("manifest generated_at must be an ISO timestamp") from error
-  releases = manifest.get("releases")
+  validate_manifest_timestamp(manifest["generated_at"])
+  releases = manifest["releases"]
   if not isinstance(releases, list):
     raise ValueError("manifest releases must be an array")
 
@@ -351,15 +415,20 @@ def load_manifest(path: Path) -> Tuple[Dict[str, List[Artifact]], str]:
   raw_protected = manifest.get("protected_object_keys", [])
   if not isinstance(raw_protected, list):
     raise ValueError("protected_object_keys must be an array")
+  protected_keys = []
   for index, key in enumerate(raw_protected):
     protected_key = require_key(key, "protected_object_keys[{}]".format(index))
+    protected_keys.append(protected_key)
     add_artifact(artifacts, protected_key, "protected-metadata")
+  require_unique(protected_keys, "protected_object_keys")
 
   for index, release in enumerate(releases):
     label = "releases[{}]".format(index)
     if not isinstance(release, dict):
       raise ValueError("{} must be an object".format(label))
-    version_parts = parse_semver(release.get("version"), label + ".version")
+    reject_unknown_fields(release, RELEASE_FIELDS, label)
+    require_fields(release, REQUIRED_RELEASE_FIELDS, label)
+    version_parts = parse_semver(release["version"], label + ".version")
     version = version_parts[:3]
     feature_line = release.get("feature_line")
     expected_feature_line = "{}.{}".format(version[0], version[1])
@@ -381,7 +450,11 @@ def load_manifest(path: Path) -> Tuple[Dict[str, List[Artifact]], str]:
     fallback = release.get("fallback", False)
     if not isinstance(fallback, bool):
       raise ValueError("{} fallback must be boolean".format(label))
-    full_key = require_key(release.get("full_zip_object_key"), label + ".full_zip_object_key")
+    if "checksum" in release:
+      checksum = release["checksum"]
+      if not isinstance(checksum, str) or not checksum:
+        raise ValueError("{} checksum must be a non-empty string".format(label))
+    full_key = require_key(release["full_zip_object_key"], label + ".full_zip_object_key")
     add_artifact(
       artifacts,
       full_key,
@@ -396,18 +469,25 @@ def load_manifest(path: Path) -> Tuple[Dict[str, List[Artifact]], str]:
       if field in release:
         metadata_key = require_key(release[field], label + "." + field)
         add_artifact(artifacts, metadata_key, "protected-metadata")
-    delta_keys = release.get("sparkle_delta_object_keys")
+    delta_keys = release["sparkle_delta_object_keys"]
     if not isinstance(delta_keys, list):
       raise ValueError("{} sparkle_delta_object_keys must be an array".format(label))
-    for delta_key in delta_keys:
+    normalized_delta_keys = []
+    for delta_index, delta_key in enumerate(delta_keys):
+      normalized_delta_key = require_key(
+        delta_key,
+        "{}.sparkle_delta_object_keys[{}]".format(label, delta_index),
+      )
+      normalized_delta_keys.append(normalized_delta_key)
       add_artifact(
         artifacts,
-        delta_key,
+        normalized_delta_key,
         "sparkle-delta",
         release_date=release_date,
         version=version,
         feature_line=feature_line,
       )
+    require_unique(normalized_delta_keys, label + ".sparkle_delta_object_keys")
   return artifacts, product
 
 

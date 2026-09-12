@@ -274,6 +274,139 @@ class ReleaseRetentionPlanTests(unittest.TestCase):
     with self.assertRaisesRegex(ValueError, "feature_line"):
       plan.build_plan(manifest_path, POLICY, None, AS_OF)
 
+  def test_rejects_misspelled_fallback_instead_of_deleting_the_release(self):
+    old_release = release("3.1.0", "2024-01-01", fallback=True)
+    old_release["fallbak"] = old_release.pop("fallback")
+    manifest = {
+      "schema_version": 1,
+      "product": "kindow",
+      "generated_at": "2026-08-26T00:00:00Z",
+      "releases": [old_release, release("3.1.4", "2024-01-02")],
+    }
+    manifest_path, inventory_path = self.write_fixture(manifest, [
+      "releases/3.1.0/app.zip",
+      "releases/3.1.4/app.zip",
+    ])
+    with self.assertRaisesRegex(ValueError, "unknown field 'fallbak'"):
+      plan.build_plan(manifest_path, POLICY, inventory_path, AS_OF)
+
+  def test_rejects_unknown_top_level_manifest_field(self):
+    manifest = {
+      "schema_version": 1,
+      "product": "kindow",
+      "generated_at": "2026-08-26T00:00:00Z",
+      "releases": [release("3.2.7", "2026-08-01")],
+      "release": [],
+    }
+    manifest_path, _ = self.write_fixture(manifest)
+    with self.assertRaisesRegex(ValueError, "unknown field 'release'"):
+      plan.build_plan(manifest_path, POLICY, None, AS_OF)
+
+  def test_rejects_missing_required_manifest_and_release_fields(self):
+    valid_manifest = {
+      "schema_version": 1,
+      "product": "kindow",
+      "generated_at": "2026-08-26T00:00:00Z",
+      "releases": [release("3.2.7", "2026-08-01")],
+    }
+    missing_product = json.loads(json.dumps(valid_manifest))
+    missing_product.pop("product")
+    missing_installer = json.loads(json.dumps(valid_manifest))
+    missing_installer["releases"][0].pop("full_zip_object_key")
+
+    for manifest, missing_field in (
+      (missing_product, "product"),
+      (missing_installer, "full_zip_object_key"),
+    ):
+      with self.subTest(missing_field=missing_field):
+        manifest_path, _ = self.write_fixture(manifest)
+        with self.assertRaisesRegex(ValueError, "missing required field {!r}".format(missing_field)):
+          plan.build_plan(manifest_path, POLICY, None, AS_OF)
+
+  def test_rejects_values_that_do_not_match_manifest_schema_types_and_formats(self):
+    base_manifest = {
+      "schema_version": 1,
+      "product": "kindow",
+      "generated_at": "2026-08-26T00:00:00Z",
+      "releases": [release("3.2.7", "2026-08-01")],
+    }
+    invalid_values = []
+
+    boolean_schema_version = json.loads(json.dumps(base_manifest))
+    boolean_schema_version["schema_version"] = True
+    invalid_values.append((boolean_schema_version, "schema_version"))
+
+    date_without_time = json.loads(json.dumps(base_manifest))
+    date_without_time["generated_at"] = "2026-08-26"
+    invalid_values.append((date_without_time, "generated_at"))
+
+    numeric_checksum = json.loads(json.dumps(base_manifest))
+    numeric_checksum["releases"][0]["checksum"] = 42
+    invalid_values.append((numeric_checksum, "checksum"))
+
+    duplicate_deltas = json.loads(json.dumps(base_manifest))
+    duplicate_deltas["releases"][0]["sparkle_delta_object_keys"] = [
+      "deltas/update.delta",
+      "deltas/update.delta",
+    ]
+    invalid_values.append((duplicate_deltas, "unique values"))
+
+    for manifest, message in invalid_values:
+      with self.subTest(message=message):
+        manifest_path, _ = self.write_fixture(manifest)
+        with self.assertRaisesRegex(ValueError, message):
+          plan.build_plan(manifest_path, POLICY, None, AS_OF)
+
+  def test_accepts_a_manifest_with_every_supported_field(self):
+    complete_release = release(
+      "3.2.7",
+      "2026-08-01",
+      fallback=True,
+      delta_keys=["kindow/deltas/3.2.6-3.2.7.delta"],
+      checksum_object_key="kindow/releases/3.2.7/SHA256SUMS",
+      signature_object_key="kindow/releases/3.2.7/SHA256SUMS.sig",
+    )
+    complete_release["full_zip_object_key"] = "kindow/releases/3.2.7/app.zip"
+    complete_release["checksum"] = "sha256:abc123"
+    manifest = {
+      "schema_version": 1,
+      "product": "kindow",
+      "generated_at": "2026-08-26T00:00:00Z",
+      "appcast_object_key": "kindow/appcast.xml",
+      "protected_object_keys": ["kindow/release-manifest.json"],
+      "releases": [complete_release],
+    }
+    inventory = [
+      "kindow/appcast.xml",
+      "kindow/release-manifest.json",
+      "kindow/releases/3.2.7/app.zip",
+      "kindow/releases/3.2.7/SHA256SUMS",
+      "kindow/releases/3.2.7/SHA256SUMS.sig",
+      "kindow/deltas/3.2.6-3.2.7.delta",
+    ]
+    manifest_path, inventory_path = self.write_fixture(manifest, inventory)
+
+    result = plan.build_plan(manifest_path, POLICY, inventory_path, AS_OF)
+
+    self.assertEqual(result["product"], "kindow")
+    self.assertEqual(
+      self.decisions(result)["kindow/releases/3.2.7/app.zip"],
+      ("keep", "fallback-release"),
+    )
+
+  def test_parser_field_contract_matches_the_canonical_manifest_schema(self):
+    schema = json.loads(
+      (ROOT / "schemas" / "release-manifest.schema.json").read_text(encoding="utf-8")
+    )
+
+    self.assertEqual(plan.MANIFEST_FIELDS, frozenset(schema["properties"]))
+    self.assertEqual(plan.REQUIRED_MANIFEST_FIELDS, frozenset(schema["required"]))
+    self.assertEqual(plan.RELEASE_FIELDS, frozenset(schema["$defs"]["release"]["properties"]))
+    self.assertEqual(
+      plan.REQUIRED_RELEASE_FIELDS,
+      frozenset(schema["$defs"]["release"]["required"]),
+    )
+
   def test_cli_accepts_deterministic_as_of_and_json_output(self):
     manifest = {
       "schema_version": 1,

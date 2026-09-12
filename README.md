@@ -121,6 +121,11 @@ accessible from that runner. Require reviewers on the protected environment.
 ## Manifest shape
 
 The canonical contract is [schemas/release-manifest.schema.json](schemas/release-manifest.schema.json).
+The planner enforces that contract before making any retention decision. It
+rejects unknown top-level or release fields, missing required fields, invalid
+types and formats, and duplicate protected or delta object keys. This is
+intentional fail-closed behavior: a misspelled safety field such as `fallbak`
+must stop planning instead of being interpreted as `fallback: false`.
 An abbreviated release looks like this:
 
 ```json

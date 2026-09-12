@@ -95,6 +95,25 @@ class RetentionApplyTests(unittest.TestCase):
     self.assertEqual(code, 2)
     run.assert_not_called()
 
+  def test_rejects_an_invalid_manifest_before_contacting_rclone(self):
+    path, retention_plan, plan_path, manifest_path = self.fixture()
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["releases"][0]["fallbak"] = True
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    with patch("apply_plan.subprocess.run") as run:
+      code = apply_plan.main([
+        "--plan", str(plan_path),
+        "--expected-plan-sha256", retention_plan["plan_id"],
+        "--product", "kindow",
+        "--rclone-remote", REMOTE,
+        "--r2-prefix", PREFIX,
+        "--manifest", str(manifest_path),
+        "--now", "2026-08-26T00:00:00Z",
+        "--result-output", str(path / "apply-result.json"),
+      ])
+    self.assertEqual(code, 2)
+    run.assert_not_called()
+
   def test_rejects_new_unknown_object_and_performs_no_delete(self):
     _, retention_plan, plan_path, _ = self.fixture()
     objects = [

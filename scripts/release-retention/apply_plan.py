@@ -16,7 +16,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from plan import InventoryObject, canonical_sha256, parse_as_of, parse_inventory_value, require_key, sha256_file
+from plan import (
+  InventoryObject,
+  canonical_sha256,
+  load_manifest,
+  parse_as_of,
+  parse_inventory_value,
+  require_key,
+  sha256_file,
+)
 
 
 UTC = timezone.utc
@@ -156,8 +164,13 @@ def validate_plan(
     raise ApplyError("plan timestamps are invalid") from error
   if expires_at <= as_of or now > expires_at:
     raise ApplyError("plan has expired")
-  if manifest_path is not None and sha256_file(manifest_path) != plan.get("manifest_sha256"):
-    raise ApplyError("manifest digest does not match the approved plan")
+  if manifest_path is not None:
+    try:
+      load_manifest(manifest_path)
+    except ValueError as error:
+      raise ApplyError("manifest is invalid: {}".format(error)) from error
+    if sha256_file(manifest_path) != plan.get("manifest_sha256"):
+      raise ApplyError("manifest digest does not match the approved plan")
   if policy_path is not None and sha256_file(policy_path) != plan.get("policy_sha256"):
     raise ApplyError("policy digest does not match the approved plan")
 
