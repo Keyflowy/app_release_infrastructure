@@ -64,6 +64,18 @@ class ReleaseRetentionPlanTests(unittest.TestCase):
       values[item["key"]] = ("delete", item["reason"])
     return values
 
+  def test_rejects_unknown_policy_field(self):
+    directory = tempfile.TemporaryDirectory()
+    self.addCleanup(directory.cleanup)
+    policy_path = Path(directory.name) / "policy.toml"
+    policy_path.write_text(
+      POLICY.read_text(encoding="utf-8") + "\nrecent_stabel_days = 730\n",
+      encoding="utf-8",
+    )
+
+    with self.assertRaisesRegex(ValueError, "unknown field 'recent_stabel_days'"):
+      plan.load_policy(policy_path)
+
   def test_retains_recent_and_exact_cutoff_stable_builds(self):
     cutoff = (AS_OF.date() - timedelta(days=730)).isoformat()
     manifest = {

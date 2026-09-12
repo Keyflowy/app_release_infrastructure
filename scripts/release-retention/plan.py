@@ -65,6 +65,14 @@ REQUIRED_RELEASE_FIELDS = frozenset({
   "full_zip_object_key",
   "sparkle_delta_object_keys",
 })
+POLICY_FIELDS = frozenset({
+  "policy_version",
+  "recent_stable_days",
+  "fallback_strategy",
+  "retain_sparkle_deltas_days",
+  "retain_prereleases_days",
+  "unknown_objects",
+})
 
 
 @dataclass(frozen=True)
@@ -177,15 +185,10 @@ def load_policy(path: Path) -> Dict[str, Any]:
       raise ValueError("invalid TOML in {}: {}".format(path, error)) from error
   if not isinstance(policy, dict):
     raise ValueError("policy must be a TOML table")
-  required = (
-    "policy_version",
-    "recent_stable_days",
-    "fallback_strategy",
-    "retain_sparkle_deltas_days",
-    "retain_prereleases_days",
-    "unknown_objects",
-  )
-  for key in required:
+  unknown = sorted(set(policy) - POLICY_FIELDS)
+  if unknown:
+    raise ValueError("policy has unknown field {!r}".format(unknown[0]))
+  for key in sorted(POLICY_FIELDS):
     if key not in policy:
       raise ValueError("policy is missing {!r}".format(key))
   if policy["policy_version"] != 1:

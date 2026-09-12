@@ -126,6 +126,8 @@ rejects unknown top-level or release fields, missing required fields, invalid
 types and formats, and duplicate protected or delta object keys. This is
 intentional fail-closed behavior: a misspelled safety field such as `fallbak`
 must stop planning instead of being interpreted as `fallback: false`.
+The planner also rejects unknown policy keys so a misspelled policy setting
+cannot coexist with a valid setting unnoticed.
 An abbreviated release looks like this:
 
 ```json
