@@ -8,9 +8,10 @@ It does not own license records, payments, device bindings, or user data.
 Each App repository owns its release workflow, R2 prefix, retention policy, and
 release manifest. This repository owns the reusable workflow, manifest schema,
 planner, and safety contract. The API service owns licensing semantics and
-records which fallback release a paid license receives. The client SDK verifies
-the signed result. A website may request an authorized download but never
-implements retention or licensing rules.
+dynamically selects the latest eligible exact archived version at activation,
+revalidation, or authorized download time. The client SDK verifies the signed
+result. A website may request an authorized download but never implements
+retention or licensing rules.
 
 Use separate R2 prefixes and scoped credentials for every product, for example:
 
@@ -43,8 +44,10 @@ objects, or changed size/modtime/hash/ID fingerprints inside that prefix fail
 closed. Objects in sibling product prefixes are ignored. A missing delete
 candidate is the only tolerated drift and is recorded as `already-absent`.
 
-Protected metadata, explicit fallback releases, recent stable installers, and
-unknown objects are never deletion candidates. The apply command performs one
+Protected metadata, live appcast references, unarchived stable installers, and
+unknown objects are never deletion candidates. Under policy v2, release-state
+metadata is eligible only after the plan workflow verifies its Drive backup and
+Git completion tombstone. The apply command performs one
 `rclone deletefile` per candidate, never a recursive delete, and stops after
 the first unexpected failure. It writes an audit result for every attempted
 object and can be retried only with the same approved plan.
@@ -54,6 +57,11 @@ repository. When a second product uses the same contract, publish a pinned
 reusable workflow tag and migrate products independently. Do not share one
 global policy file across products.
 
+Fallback cache objects are a separate ownership boundary. They are excluded
+from the release planner and must be expired by an idempotently managed native
+R2 lifecycle rule. The release planner neither lists them in an approval plan
+nor treats them as unknown objects during apply.
+
 ## Versioning
 
 Changes to the manifest schema, plan envelope, or planner behavior require a versioned release
@@ -61,3 +69,7 @@ of this repository. Policy changes remain in the App repository and require an
 ADR plus fixture-test updates there. A schema change must be additive or use a
 new schema version; the planner must reject an unknown version rather than
 guessing.
+
+Planner contract v2 adds archive evidence, live appcast binding, excluded
+prefixes, metadata evidence, and deterministic deferred batches. The v2 apply
+tool can still consume an immutable v1 plan, while new plans always use v2.

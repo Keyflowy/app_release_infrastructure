@@ -14,17 +14,23 @@
     "as_of",
     "expires_at",
     "inventory_complete",
+    "policy_version",
+    "excluded_prefixes",
+    "appcast_references",
+    "appcast_sha256",
     "manifest_sha256",
     "policy_sha256",
     "inventory_sha256",
     "cutoffs",
     "keep",
     "delete",
+    "deferred",
+    "batch",
     "summary",
     "plan_id"
   ],
   "properties": {
-    "contract_version": { "const": 1 },
+    "contract_version": { "const": 2 },
     "planner_version": { "type": "string", "minLength": 1 },
     "product": { "type": "string", "minLength": 1 },
     "rclone_remote": { "type": ["string", "null"] },
@@ -32,30 +38,63 @@
     "as_of": { "type": "string", "format": "date-time" },
     "expires_at": { "type": "string", "format": "date-time" },
     "inventory_complete": { "type": "boolean" },
+    "policy_version": {"enum": [1, 2]},
+    "excluded_prefixes": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1},
+      "uniqueItems": true
+    },
+    "appcast_references": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1},
+      "uniqueItems": true
+    },
+    "appcast_sha256": {
+      "anyOf": [
+        {"$ref": "#/$defs/sha256"},
+        {"type": "null"}
+      ]
+    },
     "manifest_sha256": { "$ref": "#/$defs/sha256" },
     "policy_sha256": { "$ref": "#/$defs/sha256" },
     "inventory_sha256": { "$ref": "#/$defs/sha256" },
     "cutoffs": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["recent_stable", "sparkle_delta", "prerelease"],
+      "required": ["recent_stable", "sparkle_delta", "prerelease", "release_metadata"],
       "properties": {
         "recent_stable": { "type": "string", "format": "date" },
         "sparkle_delta": { "type": "string", "format": "date" },
-        "prerelease": { "type": "string", "format": "date" }
+        "prerelease": { "type": "string", "format": "date" },
+        "release_metadata": {"type": "string", "format": "date"}
       }
     },
     "keep": { "type": "array", "items": { "$ref": "#/$defs/entry" } },
     "delete": { "type": "array", "items": { "$ref": "#/$defs/entry" } },
+    "deferred": {"type": "array", "items": {"$ref": "#/$defs/entry"}},
+    "batch": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["max_objects", "max_bytes", "deferred_count", "deferred_bytes"],
+      "properties": {
+        "max_objects": {"type": "integer", "minimum": 0},
+        "max_bytes": {"type": "integer", "minimum": 0},
+        "deferred_count": {"type": "integer", "minimum": 0},
+        "deferred_bytes": {"type": "integer", "minimum": 0}
+      }
+    },
     "summary": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["keep_count", "delete_count", "unknown_count", "delete_bytes"],
+      "required": ["keep_count", "delete_count", "unknown_count", "excluded_count", "deferred_count", "delete_bytes", "deferred_bytes"],
       "properties": {
         "keep_count": { "type": "integer", "minimum": 0 },
         "delete_count": { "type": "integer", "minimum": 0 },
         "unknown_count": { "type": "integer", "minimum": 0 },
-        "delete_bytes": { "type": "integer", "minimum": 0 }
+        "excluded_count": {"type": "integer", "minimum": 0},
+        "deferred_count": {"type": "integer", "minimum": 0},
+        "delete_bytes": { "type": "integer", "minimum": 0 },
+        "deferred_bytes": {"type": "integer", "minimum": 0}
       }
     },
     "plan_id": { "$ref": "#/$defs/sha256" }

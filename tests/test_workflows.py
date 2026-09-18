@@ -28,6 +28,11 @@ class RetentionWorkflowTests(unittest.TestCase):
     self.assert_runner_local_contract(workflow)
     self.assertIn("ref: ${{ job.workflow_sha }}", workflow)
     self.assertNotIn("ref: main", workflow)
+    self.assertIn("Snapshot live appcast", workflow)
+    self.assertIn('args+=(--appcast "$APPCAST_PATH")', workflow)
+    self.assertIn("Verify archive-backed retention evidence", workflow)
+    self.assertIn("verify_evidence.py", workflow)
+    self.assertIn("fetch-depth: 0", workflow)
 
   def test_apply_is_manual_caller_only_protected_and_uses_runner_local_rclone(self):
     workflow = self.workflow("reusable-retention-apply.yml")

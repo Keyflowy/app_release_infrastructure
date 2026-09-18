@@ -10,6 +10,8 @@ import hashlib
 import json
 import re
 import sys
+import urllib.parse
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -17,8 +19,9 @@ from typing import Any, Dict, FrozenSet, Iterable, List, Optional, Sequence, Tup
 
 
 UTC = timezone.utc
-PLAN_CONTRACT_VERSION = 1
-PLANNER_VERSION = "1"
+PLAN_CONTRACT_VERSION = 2
+PLANNER_VERSION = "2"
+LEGACY_PLANNER_VERSION = "1"
 SEMVER_RE = re.compile(
   r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
   r"(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?"
@@ -35,6 +38,8 @@ MANIFEST_FIELDS = frozenset({
   "generated_at",
   "appcast_object_key",
   "protected_object_keys",
+  "retention_metadata",
+  "appcast_referenced_object_keys",
   "releases",
 })
 REQUIRED_MANIFEST_FIELDS = frozenset({
@@ -51,10 +56,12 @@ RELEASE_FIELDS = frozenset({
   "notarization_status",
   "fallback",
   "full_zip_object_key",
+  "size_bytes",
   "checksum",
   "checksum_object_key",
   "signature_object_key",
   "sparkle_delta_object_keys",
+  "archive",
 })
 REQUIRED_RELEASE_FIELDS = frozenset({
   "version",
@@ -71,8 +78,53 @@ POLICY_FIELDS = frozenset({
   "fallback_strategy",
   "retain_sparkle_deltas_days",
   "retain_prereleases_days",
+  "retain_metadata_days",
+  "fallback_cache_prefix",
+  "fallback_cache_lifecycle_days",
+  "excluded_prefixes",
+  "max_delete_objects",
+  "max_delete_bytes",
   "unknown_objects",
 })
+
+ARCHIVE_FIELDS = frozenset({
+  "github_release_id",
+  "github_asset_id",
+  "github_asset_name",
+  "github_asset_sha256",
+  "github_asset_size_bytes",
+  "drive_object_key",
+  "drive_sha256",
+  "drive_size_bytes",
+  "verified",
+})
+METADATA_FIELDS = frozenset({
+  "object_key",
+  "release_date",
+  "checksum",
+  "size_bytes",
+  "backup",
+  "completion",
+  # These aliases are accepted so callers can use names that mirror the
+  # storage systems while the normalized planner representation stays flat.
+  "drive_backup",
+  "git_completion_tombstone",
+})
+BACKUP_FIELDS = frozenset({
+  "drive_object_key",
+  "sha256",
+  "size_bytes",
+  "verified",
+})
+COMPLETION_FIELDS = frozenset({
+  "git_path",
+  "git_commit",
+  "path",
+  "commit",
+  "verified",
+})
+SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+GIT_COMMIT_RE = re.compile(r"^[0-9a-fA-F]{40,64}$")
 
 
 @dataclass(frozen=True)
@@ -84,6 +136,10 @@ class Artifact:
   feature_line: Optional[str] = None
   fallback: bool = False
   notarized: bool = False
+  checksum: Optional[str] = None
+  size_bytes: Optional[int] = None
+  archive: Optional[Dict[str, Any]] = None
+  metadata_verified: bool = False
 
 
 @dataclass(frozen=True)
@@ -188,18 +244,71 @@ def load_policy(path: Path) -> Dict[str, Any]:
   unknown = sorted(set(policy) - POLICY_FIELDS)
   if unknown:
     raise ValueError("policy has unknown field {!r}".format(unknown[0]))
-  for key in sorted(POLICY_FIELDS):
+  required_fields = {
+    "policy_version",
+    "recent_stable_days",
+    "fallback_strategy",
+    "retain_sparkle_deltas_days",
+    "retain_prereleases_days",
+    "unknown_objects",
+  }
+  if policy.get("policy_version") == 2:
+    required_fields.update({
+      "retain_metadata_days",
+      "fallback_cache_prefix",
+      "fallback_cache_lifecycle_days",
+      "excluded_prefixes",
+      "max_delete_objects",
+      "max_delete_bytes",
+    })
+  for key in sorted(required_fields):
     if key not in policy:
       raise ValueError("policy is missing {!r}".format(key))
-  if policy["policy_version"] != 1:
+  if policy["policy_version"] not in (1, 2):
     raise ValueError("unsupported policy_version {!r}".format(policy["policy_version"]))
-  if policy["fallback_strategy"] != "latest-stable-patch-per-feature-line":
+  allowed_strategies = {
+    1: "latest-stable-patch-per-feature-line",
+    2: "archive-backed-exact-version",
+  }
+  if policy["fallback_strategy"] != allowed_strategies[policy["policy_version"]]:
     raise ValueError("unsupported fallback_strategy {!r}".format(policy["fallback_strategy"]))
   if policy["unknown_objects"] != "keep":
     raise ValueError("unknown_objects must be 'keep'")
   for key in ("recent_stable_days", "retain_sparkle_deltas_days", "retain_prereleases_days"):
     if not isinstance(policy[key], int) or isinstance(policy[key], bool) or policy[key] < 0:
       raise ValueError("{} must be a non-negative integer".format(key))
+  if policy["policy_version"] == 2:
+    if not isinstance(policy["retain_metadata_days"], int) or isinstance(policy["retain_metadata_days"], bool) or policy["retain_metadata_days"] < 0:
+      raise ValueError("retain_metadata_days must be a non-negative integer")
+    if not isinstance(policy["fallback_cache_prefix"], str) or not policy["fallback_cache_prefix"].endswith("/"):
+      raise ValueError("fallback_cache_prefix must be a non-empty normalized prefix")
+    require_key(policy["fallback_cache_prefix"][:-1], "fallback_cache_prefix")
+    if not isinstance(policy["fallback_cache_lifecycle_days"], int) or isinstance(policy["fallback_cache_lifecycle_days"], bool) or policy["fallback_cache_lifecycle_days"] <= 0:
+      raise ValueError("fallback_cache_lifecycle_days must be a positive integer")
+    excluded = policy["excluded_prefixes"]
+    if not isinstance(excluded, list) or not all(isinstance(item, str) for item in excluded):
+      raise ValueError("excluded_prefixes must be an array of strings")
+    normalized_excluded = []
+    for item in excluded:
+      if not item.endswith("/"):
+        raise ValueError("excluded_prefixes must contain prefixes ending in '/'")
+      require_key(item[:-1], "excluded_prefixes entry")
+      if item not in normalized_excluded:
+        normalized_excluded.append(item)
+    policy["excluded_prefixes"] = sorted(normalized_excluded)
+    for key in ("max_delete_objects", "max_delete_bytes"):
+      if not isinstance(policy[key], int) or isinstance(policy[key], bool) or policy[key] < 0:
+        raise ValueError("{} must be a non-negative integer".format(key))
+  else:
+    # Legacy policies intentionally do not opt into archive or lifecycle
+    # behavior. These defaults make the plan envelope self-describing while
+    # preserving the v1 decision rules for existing callers.
+    policy.setdefault("retain_metadata_days", 0)
+    policy.setdefault("fallback_cache_prefix", "")
+    policy.setdefault("fallback_cache_lifecycle_days", 0)
+    policy.setdefault("excluded_prefixes", [])
+    policy.setdefault("max_delete_objects", 2**31 - 1)
+    policy.setdefault("max_delete_bytes", 2**63 - 1)
   return policy
 
 
@@ -288,6 +397,158 @@ def _optional_string(value: Any, label: str) -> Optional[str]:
   return value
 
 
+def require_sha256(value: Any, label: str) -> str:
+  if not isinstance(value, str) or SHA256_RE.fullmatch(value) is None:
+    raise ValueError("{} must be a sha256:<64 lowercase hex> checksum".format(label))
+  return value
+
+
+def require_positive_integer(value: Any, label: str) -> int:
+  if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+    raise ValueError("{} must be a positive integer".format(label))
+  return value
+
+
+def validate_archive(value: Any, label: str) -> Dict[str, Any]:
+  if not isinstance(value, dict):
+    raise ValueError("{} must be an object".format(label))
+  reject_unknown_fields(value, ARCHIVE_FIELDS, label)
+  require_fields(value, ARCHIVE_FIELDS, label)
+
+  for field in ("github_release_id", "github_asset_id"):
+    identifier = value[field]
+    if isinstance(identifier, bool) or not isinstance(identifier, (str, int)):
+      raise ValueError("{}.{} must be a positive numeric identifier".format(label, field))
+    if not re.fullmatch(r"[1-9][0-9]*", str(identifier)):
+      raise ValueError("{}.{} must be a positive numeric identifier".format(label, field))
+  asset_name = value["github_asset_name"]
+  if not isinstance(asset_name, str) or not asset_name or "/" in asset_name or "\\" in asset_name:
+    raise ValueError("{}.github_asset_name must be a file name".format(label))
+  require_sha256(value["github_asset_sha256"], label + ".github_asset_sha256")
+  require_sha256(value["drive_sha256"], label + ".drive_sha256")
+  require_positive_integer(value["github_asset_size_bytes"], label + ".github_asset_size_bytes")
+  require_positive_integer(value["drive_size_bytes"], label + ".drive_size_bytes")
+  require_key(value["drive_object_key"], label + ".drive_object_key")
+  if not isinstance(value["verified"], bool):
+    raise ValueError("{}.verified must be boolean".format(label))
+  return dict(value)
+
+
+def _normalize_alias(value: Dict[str, Any], primary: str, alias: str, label: str) -> Any:
+  if primary in value and alias in value and value[primary] != value[alias]:
+    raise ValueError("{} has conflicting {!r} and {!r}".format(label, primary, alias))
+  return value.get(primary, value.get(alias))
+
+
+def validate_metadata_backup(value: Any, label: str) -> Dict[str, Any]:
+  if not isinstance(value, dict):
+    raise ValueError("{} must be an object".format(label))
+  reject_unknown_fields(value, BACKUP_FIELDS, label)
+  require_fields(value, BACKUP_FIELDS, label)
+  require_key(value["drive_object_key"], label + ".drive_object_key")
+  require_sha256(value["sha256"], label + ".sha256")
+  require_positive_integer(value["size_bytes"], label + ".size_bytes")
+  if not isinstance(value["verified"], bool):
+    raise ValueError("{}.verified must be boolean".format(label))
+  return dict(value)
+
+
+def validate_metadata_completion(value: Any, label: str) -> Dict[str, Any]:
+  if not isinstance(value, dict):
+    raise ValueError("{} must be an object".format(label))
+  reject_unknown_fields(value, COMPLETION_FIELDS, label)
+  path = _normalize_alias(value, "git_path", "path", label)
+  commit = _normalize_alias(value, "git_commit", "commit", label)
+  if not isinstance(path, str) or not path or path.startswith("/") or "\\" in path:
+    raise ValueError("{}.git_path must be a repository-relative path".format(label))
+  path_parts = path.split("/")
+  if any(part in ("", ".", "..") for part in path_parts):
+    raise ValueError("{}.git_path must be normalized".format(label))
+  if not isinstance(commit, str) or GIT_COMMIT_RE.fullmatch(commit) is None:
+    raise ValueError("{}.git_commit must be a full Git commit SHA".format(label))
+  if not isinstance(value.get("verified"), bool):
+    raise ValueError("{}.verified must be boolean".format(label))
+  return {
+    "git_path": path,
+    "git_commit": commit.lower(),
+    "verified": value["verified"],
+  }
+
+
+def validate_retention_metadata(value: Any, label: str) -> Dict[str, Any]:
+  if not isinstance(value, dict):
+    raise ValueError("{} must be an object".format(label))
+  reject_unknown_fields(value, METADATA_FIELDS, label)
+  require_fields(value, {"object_key", "release_date", "checksum", "size_bytes"}, label)
+  object_key = require_key(value["object_key"], label + ".object_key")
+  release_date = parse_release_date(value["release_date"], label + ".release_date")
+  checksum = require_sha256(value["checksum"], label + ".checksum")
+  size_bytes = require_positive_integer(value["size_bytes"], label + ".size_bytes")
+  raw_backup = _normalize_alias(value, "backup", "drive_backup", label)
+  raw_completion = _normalize_alias(value, "completion", "git_completion_tombstone", label)
+  if raw_backup is None:
+    raise ValueError("{} is missing required field 'backup'".format(label))
+  if raw_completion is None:
+    raise ValueError("{} is missing required field 'completion'".format(label))
+  backup = validate_metadata_backup(raw_backup, label + ".backup")
+  completion = validate_metadata_completion(raw_completion, label + ".completion")
+  return {
+    "object_key": object_key,
+    "release_date": release_date,
+    "checksum": checksum,
+    "size_bytes": size_bytes,
+    "backup": backup,
+    "completion": completion,
+  }
+
+
+def archive_is_verified(
+  descriptor: Artifact,
+  inventory_object: Optional[InventoryObject] = None,
+) -> bool:
+  archive = descriptor.archive
+  if descriptor.kind != "stable-installer" or archive is None:
+    return False
+  if descriptor.checksum is None or descriptor.size_bytes is None:
+    return False
+  if not SHA256_RE.fullmatch(descriptor.checksum):
+    return False
+  manifest_matches = (
+    archive.get("verified") is True
+    and archive.get("github_asset_sha256") == descriptor.checksum
+    and archive.get("drive_sha256") == descriptor.checksum
+    and archive.get("github_asset_size_bytes") == descriptor.size_bytes
+    and archive.get("drive_size_bytes") == descriptor.size_bytes
+    and archive.get("github_asset_name") == Path(descriptor.key).name
+  )
+  if not manifest_matches or inventory_object is None:
+    return manifest_matches
+  if inventory_object.size_bytes is not None and inventory_object.size_bytes != descriptor.size_bytes:
+    return False
+  hashes = {name.lower().replace("-", ""): value.lower() for name, value in inventory_object.hashes}
+  inventory_sha256 = hashes.get("sha256")
+  if inventory_sha256 is not None and inventory_sha256 != descriptor.checksum.removeprefix("sha256:"):
+    return False
+  return True
+
+
+def metadata_is_verified(
+  descriptor: Artifact,
+  inventory_object: Optional[InventoryObject] = None,
+) -> bool:
+  if descriptor.kind != "release-metadata" or not descriptor.metadata_verified:
+    return False
+  if inventory_object is None:
+    return True
+  if inventory_object.size_bytes is not None and inventory_object.size_bytes != descriptor.size_bytes:
+    return False
+  hashes = {name.lower().replace("-", ""): value.lower() for name, value in inventory_object.hashes}
+  inventory_sha256 = hashes.get("sha256")
+  if inventory_sha256 is not None and inventory_sha256 != descriptor.checksum.removeprefix("sha256:"):
+    return False
+  return True
+
+
 def parse_inventory_value(raw: Any) -> List[InventoryObject]:
   if isinstance(raw, list):
     raw_objects = raw
@@ -362,6 +623,74 @@ def scope_inventory(inventory: Sequence[InventoryObject], prefix: Optional[str])
   return [item for item in inventory if item.key.startswith(prefix)]
 
 
+def scope_managed_inventory(
+  inventory: Sequence[InventoryObject],
+  prefix: Optional[str],
+  excluded_prefixes: Sequence[str] = (),
+) -> List[InventoryObject]:
+  """Scope inventory and leave cache/manual prefixes outside retention."""
+  scoped = scope_inventory(inventory, prefix)
+  excluded = tuple(excluded_prefixes)
+  return [item for item in scoped if not any(item.key.startswith(value) for value in excluded)]
+
+
+def _appcast_key_from_url(value: Any, r2_prefix: Optional[str]) -> Optional[str]:
+  if not isinstance(value, str) or not value:
+    return None
+  parsed = urllib.parse.urlparse(value)
+  if parsed.scheme or parsed.netloc:
+    candidate = urllib.parse.unquote(parsed.path).lstrip("/")
+  else:
+    candidate = urllib.parse.unquote(value).lstrip("/")
+  if not candidate:
+    return None
+  if r2_prefix is None:
+    return candidate
+  if candidate.startswith(r2_prefix):
+    return candidate
+  if parsed.scheme or parsed.netloc:
+    return None
+  return r2_prefix + candidate
+
+
+def parse_appcast_references(path: Optional[Path], r2_prefix: Optional[str] = None) -> List[str]:
+  """Extract enclosure/delta object keys from a Sparkle appcast snapshot."""
+  if path is None:
+    return []
+  try:
+    raw = path.read_bytes()
+  except OSError as error:
+    raise ValueError("unable to read appcast: {}".format(error)) from error
+  values: List[Any] = []
+  try:
+    root = ET.fromstring(raw)
+    for element in root.iter():
+      for attribute in ("url", "sparkle:url"):
+        if attribute in element.attrib:
+          values.append(element.attrib[attribute])
+  except ET.ParseError:
+    try:
+      decoded = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+      raise ValueError("appcast must be XML or a JSON array") from error
+    if isinstance(decoded, list):
+      values.extend(decoded)
+    elif isinstance(decoded, dict):
+      raw_values = decoded.get("references", decoded.get("appcast_referenced_object_keys", []))
+      if not isinstance(raw_values, list):
+        raise ValueError("appcast JSON references must be an array")
+      values.extend(raw_values)
+    else:
+      raise ValueError("appcast must be XML or a JSON array")
+  references = []
+  for value in values:
+    key = _appcast_key_from_url(value, r2_prefix)
+    if key is None:
+      continue
+    references.append(require_key(key, "appcast reference"))
+  return sorted(set(references))
+
+
 def validate_storage(rclone_remote: str, allowed_prefix: str) -> None:
   if not isinstance(rclone_remote, str) or not re.fullmatch(r"[A-Za-z0-9._-]+:.+/", rclone_remote):
     raise ValueError("rclone_remote must look like remote:path/ and end in '/'")
@@ -382,6 +711,10 @@ def add_artifact(
   feature_line: Optional[str] = None,
   fallback: bool = False,
   notarized: bool = False,
+  checksum: Optional[str] = None,
+  size_bytes: Optional[int] = None,
+  archive: Optional[Dict[str, Any]] = None,
+  metadata_verified: bool = False,
 ) -> None:
   object_key = require_key(key, "artifact object key")
   artifacts.setdefault(object_key, []).append(Artifact(
@@ -392,6 +725,10 @@ def add_artifact(
     feature_line=feature_line,
     fallback=fallback,
     notarized=notarized,
+    checksum=checksum,
+    size_bytes=size_bytes,
+    archive=archive,
+    metadata_verified=metadata_verified,
   ))
 
 
@@ -415,6 +752,17 @@ def load_manifest(path: Path) -> Tuple[Dict[str, List[Artifact]], str]:
   if "appcast_object_key" in manifest:
     appcast_key = require_key(manifest["appcast_object_key"], "appcast_object_key")
     add_artifact(artifacts, appcast_key, "protected-metadata")
+  raw_appcast_references = manifest.get("appcast_referenced_object_keys", [])
+  if not isinstance(raw_appcast_references, list):
+    raise ValueError("appcast_referenced_object_keys must be an array")
+  appcast_references = []
+  for index, key in enumerate(raw_appcast_references):
+    reference_key = require_key(key, "appcast_referenced_object_keys[{}]".format(index))
+    appcast_references.append(reference_key)
+    # Appcast references are hot dependencies, not protected metadata. They
+    # remain eligible for normal age handling once no longer referenced.
+    add_artifact(artifacts, reference_key, "appcast-reference")
+  require_unique(appcast_references, "appcast_referenced_object_keys")
   raw_protected = manifest.get("protected_object_keys", [])
   if not isinstance(raw_protected, list):
     raise ValueError("protected_object_keys must be an array")
@@ -424,6 +772,27 @@ def load_manifest(path: Path) -> Tuple[Dict[str, List[Artifact]], str]:
     protected_keys.append(protected_key)
     add_artifact(artifacts, protected_key, "protected-metadata")
   require_unique(protected_keys, "protected_object_keys")
+
+  raw_retention_metadata = manifest.get("retention_metadata", [])
+  if not isinstance(raw_retention_metadata, list):
+    raise ValueError("retention_metadata must be an array")
+  for index, raw_metadata in enumerate(raw_retention_metadata):
+    label = "retention_metadata[{}]".format(index)
+    metadata = validate_retention_metadata(raw_metadata, label)
+    add_artifact(
+      artifacts,
+      metadata["object_key"],
+      "release-metadata",
+      release_date=metadata["release_date"],
+      checksum=metadata["checksum"],
+      size_bytes=metadata["size_bytes"],
+      metadata_verified=(
+        metadata["backup"]["verified"] is True
+        and metadata["backup"]["sha256"] == metadata["checksum"]
+        and metadata["backup"]["size_bytes"] == metadata["size_bytes"]
+        and metadata["completion"]["verified"] is True
+      ),
+    )
 
   for index, release in enumerate(releases):
     label = "releases[{}]".format(index)
@@ -453,10 +822,19 @@ def load_manifest(path: Path) -> Tuple[Dict[str, List[Artifact]], str]:
     fallback = release.get("fallback", False)
     if not isinstance(fallback, bool):
       raise ValueError("{} fallback must be boolean".format(label))
+    checksum = None
     if "checksum" in release:
       checksum = release["checksum"]
       if not isinstance(checksum, str) or not checksum:
         raise ValueError("{} checksum must be a non-empty string".format(label))
+    size_bytes = None
+    if "size_bytes" in release:
+      size_bytes = release["size_bytes"]
+      if not isinstance(size_bytes, int) or isinstance(size_bytes, bool) or size_bytes <= 0:
+        raise ValueError("{} size_bytes must be a positive integer".format(label))
+    archive = None
+    if "archive" in release:
+      archive = validate_archive(release["archive"], label + ".archive")
     full_key = require_key(release["full_zip_object_key"], label + ".full_zip_object_key")
     add_artifact(
       artifacts,
@@ -467,6 +845,9 @@ def load_manifest(path: Path) -> Tuple[Dict[str, List[Artifact]], str]:
       feature_line=feature_line,
       fallback=fallback,
       notarized=notarization_status == "notarized",
+      checksum=checksum,
+      size_bytes=size_bytes,
+      archive=archive,
     )
     for field in ("checksum_object_key", "signature_object_key"):
       if field in release:
@@ -514,16 +895,36 @@ def decide_descriptor(
   delta_cutoff: date,
   prerelease_cutoff: date,
   latest_stable: Dict[str, Tuple[int, int, int]],
+  archive_policy: bool = False,
+  appcast_references: FrozenSet[str] = frozenset(),
+  metadata_cutoff: Optional[date] = None,
+  inventory_object: Optional[InventoryObject] = None,
 ) -> Tuple[str, str]:
   if descriptor.kind == "protected-metadata":
     return "keep", "protected-metadata"
-  if descriptor.fallback:
+  if descriptor.kind == "release-metadata":
+    if not archive_policy:
+      return "keep", "protected-metadata"
+    if descriptor.release_date is not None and metadata_cutoff is not None and descriptor.release_date >= metadata_cutoff:
+      return "keep", "recent-release-metadata"
+    if metadata_is_verified(descriptor, inventory_object):
+      return "delete", "expired-release-metadata"
+    return "keep", "unverified-release-metadata"
+  if descriptor.kind == "appcast-reference":
+    return "keep", "appcast-reference"
+  if descriptor.key in appcast_references:
+    return "keep", "appcast-reference"
+  if descriptor.fallback and not archive_policy:
     return "keep", "fallback-release"
   if descriptor.kind == "stable-installer":
     if not descriptor.notarized:
       return "keep", "unverified-stable-installer"
     if descriptor.release_date is not None and descriptor.release_date >= recent_cutoff:
       return "keep", "recent-stable"
+    if archive_policy:
+      if archive_is_verified(descriptor, inventory_object):
+        return "delete", "archived-stable-expired"
+      return "keep", "awaiting-archive-verification"
     if (
       descriptor.feature_line is not None
       and descriptor.version is not None
@@ -540,6 +941,33 @@ def decide_descriptor(
       return "keep", "recent-prerelease"
     return "delete", "expired-prerelease"
   return "keep", "unknown-artifact"
+
+
+def bounded_delete_batch(
+  candidates: Sequence[Dict[str, Any]],
+  max_objects: int,
+  max_bytes: int,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+  """Select a deterministic bounded prefix and defer the rest.
+
+  Deferral is represented as a keep decision in the current immutable plan;
+  the next fresh plan can revisit it. This avoids a permanent guard failure
+  when a backlog is larger than one run's safety budget.
+  """
+  selected: List[Dict[str, Any]] = []
+  deferred: List[Dict[str, Any]] = []
+  used_bytes = 0
+  for candidate in sorted(candidates, key=lambda item: item["key"]):
+    candidate_bytes = candidate.get("size_bytes", 0)
+    if (
+      len(selected) >= max_objects
+      or used_bytes + candidate_bytes > max_bytes
+    ):
+      deferred.append(candidate)
+      continue
+    selected.append(candidate)
+    used_bytes += candidate_bytes
+  return selected, deferred
 
 
 def inventory_entry(item: InventoryObject, kind: str, reason: str) -> Dict[str, Any]:
@@ -571,6 +999,10 @@ def build_plan(
   rclone_remote: Optional[str] = None,
   r2_prefix: Optional[str] = None,
   plan_ttl_hours: int = 24,
+  appcast_path: Optional[Path] = None,
+  appcast_references: Optional[Sequence[str]] = None,
+  max_delete_objects: Optional[int] = None,
+  max_delete_bytes: Optional[int] = None,
 ) -> Dict[str, Any]:
   if plan_ttl_hours <= 0:
     raise ValueError("plan_ttl_hours must be positive")
@@ -580,12 +1012,48 @@ def build_plan(
     validate_storage(rclone_remote, r2_prefix)
   policy = load_policy(policy_path)
   artifacts, product = load_manifest(manifest_path)
+  archive_policy = policy["policy_version"] >= 2
+  manifest = load_json(manifest_path)
+  if (
+    archive_policy
+    and inventory_path is not None
+    and rclone_remote is not None
+    and manifest.get("appcast_object_key")
+    and appcast_path is None
+  ):
+    raise ValueError("policy v2 complete plans require a live appcast snapshot")
+  excluded_prefixes = list(policy.get("excluded_prefixes", []))
+  cache_prefix = policy.get("fallback_cache_prefix", "")
+  if cache_prefix and cache_prefix not in excluded_prefixes:
+    excluded_prefixes.append(cache_prefix)
+  excluded_prefixes = sorted(set(excluded_prefixes))
+  if r2_prefix is not None:
+    outside_exclusions = [
+      value for value in excluded_prefixes
+      if not value.startswith(r2_prefix)
+    ]
+    if outside_exclusions:
+      raise ValueError("excluded prefix is outside r2_prefix: {}".format(sorted(outside_exclusions)[0]))
   inventory = parse_inventory(inventory_path, artifacts.keys())
   if r2_prefix is not None:
     invalid_manifest_keys = sorted(key for key in artifacts if not key.startswith(r2_prefix))
     if invalid_manifest_keys:
       raise ValueError("manifest object is outside r2_prefix: {}".format(invalid_manifest_keys[0]))
-    inventory = scope_inventory(inventory, r2_prefix)
+  inventory_before_exclusions = scope_inventory(inventory, r2_prefix)
+  inventory = scope_managed_inventory(inventory, r2_prefix, excluded_prefixes)
+  parsed_appcast_references = set(
+    parse_appcast_references(appcast_path, r2_prefix)
+  )
+  if appcast_references is not None:
+    for index, value in enumerate(appcast_references):
+      key = _appcast_key_from_url(value, r2_prefix)
+      if key is None:
+        raise ValueError("invalid appcast reference at index {}".format(index))
+      parsed_appcast_references.add(require_key(key, "appcast reference"))
+  for descriptors in artifacts.values():
+    for descriptor in descriptors:
+      if descriptor.kind == "appcast-reference":
+        parsed_appcast_references.add(descriptor.key)
   reference_time = as_of or datetime.now(UTC)
   if reference_time.tzinfo is None:
     reference_time = reference_time.replace(tzinfo=UTC)
@@ -594,11 +1062,13 @@ def build_plan(
   recent_cutoff = reference_date - timedelta(days=policy["recent_stable_days"])
   delta_cutoff = reference_date - timedelta(days=policy["retain_sparkle_deltas_days"])
   prerelease_cutoff = reference_date - timedelta(days=policy["retain_prereleases_days"])
+  metadata_cutoff = reference_date - timedelta(days=policy.get("retain_metadata_days", 0))
   latest_stable = choose_latest_stable(artifacts)
 
   keep: List[Dict[str, Any]] = []
   delete: List[Dict[str, Any]] = []
   unknown_count = 0
+  excluded_count = len(inventory_before_exclusions) - len(inventory)
   for item in inventory:
     descriptors = artifacts.get(item.key)
     if descriptors is None:
@@ -612,6 +1082,10 @@ def build_plan(
         delta_cutoff,
         prerelease_cutoff,
         latest_stable,
+        archive_policy,
+        frozenset(parsed_appcast_references),
+        metadata_cutoff,
+        item,
       )
       for descriptor in descriptors
     ]
@@ -627,8 +1101,29 @@ def build_plan(
     else:
       delete.append(inventory_entry(item, kind, decisions[0][1]))
 
+  configured_max_objects = policy.get("max_delete_objects", 2**31 - 1)
+  configured_max_bytes = policy.get("max_delete_bytes", 2**63 - 1)
+  if max_delete_objects is not None:
+    if max_delete_objects < 0:
+      raise ValueError("max_delete_objects must be non-negative")
+    configured_max_objects = min(configured_max_objects, max_delete_objects)
+  if max_delete_bytes is not None:
+    if max_delete_bytes < 0:
+      raise ValueError("max_delete_bytes must be non-negative")
+    configured_max_bytes = min(configured_max_bytes, max_delete_bytes)
+  selected_delete, deferred_delete = bounded_delete_batch(
+    delete,
+    configured_max_objects,
+    configured_max_bytes,
+  )
+  for item in deferred_delete:
+    deferred_entry = dict(item)
+    deferred_entry["reason"] = "deferred-delete-batch"
+    keep.append(deferred_entry)
+
   keep.sort(key=lambda item: item["key"])
-  delete.sort(key=lambda item: item["key"])
+  selected_delete.sort(key=lambda item: item["key"])
+  deferred_delete.sort(key=lambda item: item["key"])
   payload: Dict[str, Any] = {
     "contract_version": PLAN_CONTRACT_VERSION,
     "planner_version": PLANNER_VERSION,
@@ -638,6 +1133,10 @@ def build_plan(
     "as_of": reference_time.isoformat().replace("+00:00", "Z"),
     "expires_at": (reference_time + timedelta(hours=plan_ttl_hours)).isoformat().replace("+00:00", "Z"),
     "inventory_complete": inventory_path is not None,
+    "policy_version": policy["policy_version"],
+    "excluded_prefixes": excluded_prefixes,
+    "appcast_references": sorted(parsed_appcast_references),
+    "appcast_sha256": sha256_file(appcast_path) if appcast_path is not None else None,
     "manifest_sha256": sha256_file(manifest_path),
     "policy_sha256": sha256_file(policy_path),
     "inventory_sha256": inventory_digest(inventory),
@@ -645,14 +1144,25 @@ def build_plan(
       "recent_stable": recent_cutoff.isoformat(),
       "sparkle_delta": delta_cutoff.isoformat(),
       "prerelease": prerelease_cutoff.isoformat(),
+      "release_metadata": metadata_cutoff.isoformat(),
     },
     "keep": keep,
-    "delete": delete,
+    "delete": selected_delete,
+    "deferred": deferred_delete,
+    "batch": {
+      "max_objects": configured_max_objects,
+      "max_bytes": configured_max_bytes,
+      "deferred_count": len(deferred_delete),
+      "deferred_bytes": sum(item.get("size_bytes", 0) for item in deferred_delete),
+    },
     "summary": {
       "keep_count": len(keep),
-      "delete_count": len(delete),
+      "delete_count": len(selected_delete),
       "unknown_count": unknown_count,
-      "delete_bytes": sum(item.get("size_bytes", 0) for item in delete),
+      "excluded_count": excluded_count,
+      "deferred_count": len(deferred_delete),
+      "delete_bytes": sum(item.get("size_bytes", 0) for item in selected_delete),
+      "deferred_bytes": sum(item.get("size_bytes", 0) for item in deferred_delete),
     },
   }
   payload["plan_id"] = canonical_sha256(payload)
@@ -690,6 +1200,13 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
   parser.add_argument("--rclone-remote", help="rclone remote root used by the apply step, for example cf_r2:keyflowy-apps/")
   parser.add_argument("--r2-prefix", help="complete object prefix, including trailing slash")
   parser.add_argument(
+    "--appcast",
+    type=Path,
+    help="snapshot of the live appcast whose enclosure and delta objects must be retained",
+  )
+  parser.add_argument("--max-delete-objects", type=int)
+  parser.add_argument("--max-delete-bytes", type=int)
+  parser.add_argument(
     "--plan-ttl-hours",
     type=int,
     default=24,
@@ -709,6 +1226,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
       args.rclone_remote,
       args.r2_prefix,
       args.plan_ttl_hours,
+      args.appcast,
+      None,
+      args.max_delete_objects,
+      args.max_delete_bytes,
     )
     rendered = render_text(plan) if args.format == "text" else json.dumps(plan, indent=2) + "\n"
     if args.output is None:

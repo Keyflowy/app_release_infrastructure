@@ -13,7 +13,7 @@ channel, notarization status, installer key, and Sparkle delta keys. A
 manifest may also mark a release as `fallback` and may list protected appcast,
 checksum, or signature objects.
 
-The checked-in example policy keeps:
+The checked-in example policy demonstrates the legacy v1 strategy and keeps:
 
 - every notarized stable installer from the last 730 UTC calendar days;
 - the highest stable patch of every older feature line;
@@ -22,6 +22,19 @@ The checked-in example policy keeps:
 - prerelease installers for 30 days;
 - appcast and metadata objects forever;
 - objects not present in the manifest forever.
+
+Production products may opt into policy v2 with
+`fallback_strategy = "archive-backed-exact-version"`. Under v2, the planner:
+
+- keeps recent stable installers in R2 as the hot update layer;
+- deletes an expired stable installer only when its GitHub Release and Google
+  Drive copies have matching SHA-256 and size evidence;
+- protects every installer and delta referenced by the live R2 appcast;
+- ages release-state metadata only after its Drive bytes and committed Git
+  completion tombstone have been verified by the reusable workflow;
+- excludes fallback-cache prefixes owned by a separate native R2 lifecycle;
+- limits each deterministic deletion batch and defers the remainder to the
+  next scheduled plan.
 
 The cutoff dates are inclusive. An object released exactly on a cutoff date is
 kept. A stable installer that is not notarized is kept for investigation and
@@ -41,6 +54,9 @@ never receives rclone credentials as a secret. It is a planning workflow, not
 an apply workflow. Consumers should pin the shared workflow to a reviewed
 release tag once the repository's first release is published. Do not use a
 mutable branch for production callers.
+For policy v2 it also snapshots the current R2 appcast, verifies every declared
+Drive backup byte-for-byte, and proves each Git completion tombstone exists at
+the declared commit before producing a plan.
 
 ## Running the planner
 
@@ -156,11 +172,12 @@ An abbreviated release looks like this:
 }
 ```
 
-`fallback` is an explicit product/licensing decision. The retention planner
-does not choose a fallback for a license; it only guarantees that a manifest
-marked fallback cannot be deleted. The licensing service should generate or
-update the manifest marker when a fallback release becomes part of the
-product's entitlement policy.
+`fallback` remains the v1 compatibility marker. Policy v2 does not keep a
+separate R2 installer for every entitlement cutoff: the licensing service
+selects the exact archived version, serves GitHub Releases as the primary
+archive, falls back to Google Drive, and may populate a short-lived R2 cache.
+That cache must have a native bucket lifecycle because it is deliberately
+outside this planner's inventory and delete plan.
 
 ## Tests
 
@@ -170,6 +187,6 @@ The tests use only Python's standard `unittest` library:
 python3 -m unittest discover -s tests -v
 ```
 
-The tests include exact cutoff dates, old feature-line patch compression,
-fallback protection, unnotarized stable releases, delta/prerelease expiry,
-unknown-object preservation, deterministic output, and CLI text/JSON output.
+The tests include v1 compatibility, archive-evidence gating, live appcast
+protection, release metadata evidence, cache exclusion, bounded batch
+progression, apply idempotency, deterministic output, and schema parity.

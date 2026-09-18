@@ -28,11 +28,14 @@ from plan import (
 
 
 UTC = timezone.utc
-APPLY_CONTRACT_VERSION = 1
+APPLY_CONTRACT_VERSION = 2
+SUPPORTED_PLAN_CONTRACT_VERSIONS = {1, 2}
 ALLOWED_DELETE_REASONS = {
   "superseded-stable-patch": "stable-installer",
+  "archived-stable-expired": "stable-installer",
   "expired-sparkle-delta": "sparkle-delta",
   "expired-prerelease": "prerelease-installer",
+  "expired-release-metadata": "release-metadata",
 }
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
@@ -134,7 +137,7 @@ def validate_plan(
 ) -> Tuple[Dict[str, Any], Dict[str, InventoryObject], Dict[str, InventoryObject]]:
   if not isinstance(plan, dict):
     raise ApplyError("plan must be a JSON object")
-  if plan.get("contract_version") != APPLY_CONTRACT_VERSION:
+  if plan.get("contract_version") not in SUPPORTED_PLAN_CONTRACT_VERSIONS:
     raise ApplyError("unsupported plan contract_version")
   if not isinstance(plan.get("planner_version"), str) or not plan["planner_version"]:
     raise ApplyError("plan planner_version is missing")
@@ -186,6 +189,15 @@ def validate_plan(
   for key in list(keep) + list(delete):
     if not key.startswith(prefix):
       raise ApplyError("plan object is outside r2_prefix: {}".format(key))
+  excluded_prefixes = plan.get("excluded_prefixes", [])
+  if not isinstance(excluded_prefixes, list):
+    raise ApplyError("plan excluded_prefixes must be an array")
+  for excluded_prefix in excluded_prefixes:
+    if not isinstance(excluded_prefix, str) or not excluded_prefix.endswith("/"):
+      raise ApplyError("plan excluded_prefixes contains an invalid prefix")
+    require_key(excluded_prefix[:-1], "excluded_prefix")
+    if not excluded_prefix.startswith(prefix):
+      raise ApplyError("excluded prefix is outside r2_prefix: {}".format(excluded_prefix))
   for index, entry in enumerate(delete_raw):
     reason = entry.get("reason")
     expected_kind = ALLOWED_DELETE_REASONS.get(reason)
@@ -218,7 +230,12 @@ def run_command(rclone_bin: str, arguments: Sequence[str]) -> subprocess.Complet
   )
 
 
-def list_inventory(rclone_bin: str, remote: str, prefix: str) -> Dict[str, InventoryObject]:
+def list_inventory(
+  rclone_bin: str,
+  remote: str,
+  prefix: str,
+  excluded_prefixes: Sequence[str] = (),
+) -> Dict[str, InventoryObject]:
   result = run_command(rclone_bin, [
     "lsjson",
     "--recursive",
@@ -234,6 +251,7 @@ def list_inventory(rclone_bin: str, remote: str, prefix: str) -> Dict[str, Inven
       item.key: item
       for item in parse_inventory_value(json.loads(result.stdout))
       if item.key.startswith(prefix)
+      and not any(item.key.startswith(excluded) for excluded in excluded_prefixes)
     }
   except (ApplyError, ValueError, json.JSONDecodeError) as error:
     raise ApplyError("rclone lsjson returned an invalid inventory: {}".format(error)) from error
@@ -311,7 +329,12 @@ def apply_plan(
 
   remote = plan["rclone_remote"]
   try:
-    actual = list_inventory(rclone_bin, remote, plan["r2_prefix"])
+    actual = list_inventory(
+      rclone_bin,
+      remote,
+      plan["r2_prefix"],
+      plan.get("excluded_prefixes", []),
+    )
     compare_inventory(keep, delete, actual)
   except ApplyError as error:
     result["status"] = "failed"
@@ -337,7 +360,12 @@ def apply_plan(
       statuses[index]["status"] = "deleted"
       continue
     try:
-      after_failure = list_inventory(rclone_bin, remote, plan["r2_prefix"])
+      after_failure = list_inventory(
+        rclone_bin,
+        remote,
+        plan["r2_prefix"],
+        plan.get("excluded_prefixes", []),
+      )
     except ApplyError:
       statuses[index]["status"] = "failed"
       statuses[index]["error"] = (command_result.stderr or command_result.stdout).strip()
@@ -352,7 +380,12 @@ def apply_plan(
     return 1, result
 
   try:
-    final_inventory = list_inventory(rclone_bin, remote, plan["r2_prefix"])
+    final_inventory = list_inventory(
+      rclone_bin,
+      remote,
+      plan["r2_prefix"],
+      plan.get("excluded_prefixes", []),
+    )
     compare_inventory(keep, {}, final_inventory)
   except ApplyError as error:
     result["status"] = "failed"

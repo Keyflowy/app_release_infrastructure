@@ -55,6 +55,8 @@ jobs:
     steps:
       - name: Checkout caller repository
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
 
       - name: Checkout shared planner
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -132,6 +134,45 @@ jobs:
           echo "path=$inventory_path" >> "$GITHUB_OUTPUT"
           echo "complete=true" >> "$GITHUB_OUTPUT"
 
+      - name: Verify archive-backed retention evidence
+        if: ${{ inputs.rclone_remote != '' }}
+        run: |
+          set -euo pipefail
+          python3 .release-infrastructure/scripts/release-retention/verify_evidence.py \
+            --manifest "${{ inputs.manifest }}" \
+            --repository "$GITHUB_WORKSPACE" \
+            --drive-remote gd_admin: \
+            --rclone rclone
+
+      - name: Snapshot live appcast
+        id: appcast
+        if: ${{ inputs.rclone_remote != '' }}
+        env:
+          MANIFEST_PATH: ${{ inputs.manifest }}
+          RCLONE_REMOTE: ${{ inputs.rclone_remote }}
+        run: |
+          set -euo pipefail
+
+          appcast_key="$(python3 - "$MANIFEST_PATH" <<'PY'
+          import json
+          import sys
+
+          with open(sys.argv[1], encoding="utf-8") as source:
+            value = json.load(source).get("appcast_object_key", "")
+          if value and not isinstance(value, str):
+            raise SystemExit("appcast_object_key must be a string")
+          print(value)
+          PY
+          )"
+          if [ -z "$appcast_key" ]; then
+            exit 0
+          fi
+
+          appcast_path="$RUNNER_TEMP/release-retention-appcast.xml"
+          rclone copyto "$RCLONE_REMOTE$appcast_key" "$appcast_path"
+          test -s "$appcast_path"
+          echo "path=$appcast_path" >> "$GITHUB_OUTPUT"
+
       - name: Build deterministic retention plan
         env:
           MANIFEST_PATH: ${{ inputs.manifest }}
@@ -140,6 +181,7 @@ jobs:
           AS_OF: ${{ inputs.as_of }}
           RCLONE_REMOTE: ${{ inputs.rclone_remote }}
           R2_PREFIX: ${{ inputs.r2_prefix }}
+          APPCAST_PATH: ${{ steps.appcast.outputs.path }}
         run: |
           set -euo pipefail
 
@@ -160,6 +202,10 @@ jobs:
 
           if [ -n "$RCLONE_REMOTE" ]; then
             args+=(--rclone-remote "$RCLONE_REMOTE" --r2-prefix "$R2_PREFIX")
+          fi
+
+          if [ -n "$APPCAST_PATH" ]; then
+            args+=(--appcast "$APPCAST_PATH")
           fi
 
           python3 .release-infrastructure/scripts/release-retention/plan.py "${args[@]}"

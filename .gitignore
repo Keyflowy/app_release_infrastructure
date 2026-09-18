@@ -1,3 +1,5 @@
 retention-plan.json
 inventory.json
 apply-result.json
+__pycache__/
+*.pyc

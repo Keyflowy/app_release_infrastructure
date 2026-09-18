@@ -169,6 +169,62 @@ class RetentionApplyTests(unittest.TestCase):
     self.assertEqual(code, 0)
     self.assertEqual(run.call_count, 2)
 
+  def test_ignores_objects_under_the_plans_excluded_cache_prefix(self):
+    _, retention_plan, plan_path, _ = self.fixture()
+    retention_plan["excluded_prefixes"] = ["kindow/fallback-cache/"]
+    retention_plan.pop("plan_id")
+    retention_plan["plan_id"] = plan.canonical_sha256(retention_plan)
+    plan_path.write_text(json.dumps(retention_plan), encoding="utf-8")
+    objects = [
+      inventory_item("3.1.0", 10, "old"),
+      inventory_item("3.1.4", 20, "new"),
+      {
+        "Path": "kindow/fallback-cache/3.1.0/archive.zip",
+        "Size": 10,
+        "ModTime": "2026-08-25T00:00:00Z",
+        "Hashes": {"MD5": "cache"},
+      },
+    ]
+    with patch("apply_plan.subprocess.run", side_effect=lambda args, **kwargs: CompletedProcess(
+      args=args,
+      returncode=0,
+      stdout=self.lsjson(objects) if args[1] == "lsjson" else "",
+      stderr="",
+    )) as run:
+      code = apply_plan.main([
+        "--plan", str(plan_path),
+        "--expected-plan-sha256", retention_plan["plan_id"],
+        "--product", "kindow",
+        "--rclone-remote", REMOTE,
+        "--r2-prefix", PREFIX,
+        "--now", "2026-08-26T00:00:00Z",
+      ])
+    self.assertEqual(code, 0)
+    self.assertEqual(run.call_count, 2)
+
+  def test_accepts_the_v2_archived_installer_delete_reason(self):
+    _, retention_plan, plan_path, _ = self.fixture()
+    retention_plan["delete"][0]["reason"] = "archived-stable-expired"
+    retention_plan.pop("plan_id")
+    retention_plan["plan_id"] = plan.canonical_sha256(retention_plan)
+    plan_path.write_text(json.dumps(retention_plan), encoding="utf-8")
+    objects = [inventory_item("3.1.0", 10, "old"), inventory_item("3.1.4", 20, "new")]
+    with patch("apply_plan.subprocess.run", side_effect=lambda args, **kwargs: CompletedProcess(
+      args=args,
+      returncode=0,
+      stdout=self.lsjson(objects) if args[1] == "lsjson" else "",
+      stderr="",
+    )):
+      code = apply_plan.main([
+        "--plan", str(plan_path),
+        "--expected-plan-sha256", retention_plan["plan_id"],
+        "--product", "kindow",
+        "--rclone-remote", REMOTE,
+        "--r2-prefix", PREFIX,
+        "--now", "2026-08-26T00:00:00Z",
+      ])
+    self.assertEqual(code, 0)
+
   def test_without_execute_only_dry_runs_each_candidate_without_a_shell(self):
     _, retention_plan, plan_path, _ = self.fixture()
     objects = [inventory_item("3.1.0", 10, "old"), inventory_item("3.1.4", 20, "new")]
