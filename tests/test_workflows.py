@@ -10,8 +10,8 @@ class RetentionWorkflowTests(unittest.TestCase):
     return (ROOT / ".github" / "workflows" / name).read_text(encoding="utf-8")
 
   def assert_runner_local_contract(self, workflow):
-    self.assertIn("runs-on: ${{ fromJSON(inputs.runs_on) }}", workflow)
-    self.assertIn(r'default: "[\"self-hosted\",\"Linux\",\"home\"]"', workflow)
+    self.assertIn("runs-on: [self-hosted, Linux, home]", workflow)
+    self.assertNotIn("runs_on:", workflow)
     self.assertIn("RUNNER_ENVIRONMENT", workflow)
     self.assertIn("RUNNER_OS", workflow)
     self.assertIn("command -v rclone", workflow)

@@ -53,16 +53,10 @@ on:
         required: false
         type: number
         default: 53687091200
-      runs_on:
-        description: JSON array of runner labels, or a single runner label; retention runs on a fixed self-hosted Linux home runner whose rclone configuration is runner-local
-        required: false
-        type: string
-        default: "[\"self-hosted\",\"Linux\",\"home\"]"
-
 jobs:
   apply:
     if: ${{ inputs.execute }}
-    runs-on: ${{ fromJSON(inputs.runs_on) }}
+    runs-on: [self-hosted, Linux, home]
     timeout-minutes: 30
     environment: release-retention-production
     concurrency:

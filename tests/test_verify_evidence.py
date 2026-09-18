@@ -95,6 +95,18 @@ class RetentionEvidenceTests(unittest.TestCase):
 
     self.assertEqual(run.call_count, 1)
 
+  def test_given_a_transient_drive_failure_when_reading_evidence_then_a_fresh_process_retries(self):
+    with (
+      patch.object(VERIFY, "run_bytes", side_effect=[ValueError("timeout"), b"contents"]) as run,
+      patch.object(VERIFY.time, "sleep") as sleep,
+    ):
+      contents = VERIFY.rclone_cat("rclone", "gd_admin:path/to/object")
+
+    self.assertEqual(contents, b"contents")
+    self.assertEqual(run.call_count, 2)
+    self.assertEqual(run.call_args_list[0], run.call_args_list[1])
+    sleep.assert_called_once_with(5)
+
   def test_git_tombstone_must_bind_the_same_release(self):
     manifest, contents, _ = self.fixture()
     wrong_tombstone = b'{"release_id":"v9.9.9","version":"9.9.9"}\n'

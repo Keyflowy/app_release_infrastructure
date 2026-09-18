@@ -7,6 +7,8 @@ import json
 import os
 import re
 import subprocess
+import sys
+import time
 from pathlib import Path
 
 
@@ -14,11 +16,12 @@ SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 STATE_KEY_RE = re.compile(r"^[^/]+/release-state/(v[0-9]+\.[0-9]+\.[0-9]+)/[^/]+$")
 COMMAND_TIMEOUT_SECONDS = 300
 RCLONE_TIMEOUT_FLAGS = (
-  "--timeout", "45s",
+  "--timeout", "30s",
   "--contimeout", "10s",
-  "--retries", "2",
-  "--low-level-retries", "2",
+  "--retries", "1",
+  "--low-level-retries", "1",
 )
+RCLONE_RETRY_DELAYS_SECONDS = (5, 15)
 
 
 def run_bytes(command):
@@ -49,7 +52,21 @@ def remote_object(remote, object_key):
 
 
 def rclone_cat(rclone, object_path):
-  return run_bytes([rclone, *RCLONE_TIMEOUT_FLAGS, "cat", object_path])
+  command = [rclone, *RCLONE_TIMEOUT_FLAGS, "cat", object_path]
+  for attempt in range(len(RCLONE_RETRY_DELAYS_SECONDS) + 1):
+    try:
+      return run_bytes(command)
+    except ValueError:
+      if attempt == len(RCLONE_RETRY_DELAYS_SECONDS):
+        raise
+      delay = RCLONE_RETRY_DELAYS_SECONDS[attempt]
+      print(
+        "retention evidence: Drive read failed; retrying with a fresh rclone "
+        "process in {} seconds".format(delay),
+        file=sys.stderr,
+      )
+      time.sleep(delay)
+  raise AssertionError("unreachable")
 
 
 def verify_archive(release, repository, github_repository, drive_remote, rclone, gh):

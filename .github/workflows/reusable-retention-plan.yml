@@ -38,18 +38,12 @@ on:
         required: false
         type: string
         default: ""
-      runs_on:
-        description: JSON array of runner labels, or a single runner label; retention runs on a fixed self-hosted Linux home runner whose rclone configuration is runner-local
-        required: false
-        type: string
-        default: "[\"self-hosted\",\"Linux\",\"home\"]"
-
 jobs:
   plan:
     outputs:
       plan_artifact_id: ${{ steps.publish.outputs.artifact-id }}
       plan_sha256: ${{ steps.digest.outputs.sha256 }}
-    runs-on: ${{ fromJSON(inputs.runs_on) }}
+    runs-on: [self-hosted, Linux, home]
     timeout-minutes: 30
     permissions:
       contents: read
