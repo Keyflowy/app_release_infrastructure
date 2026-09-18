@@ -12,10 +12,24 @@ from pathlib import Path
 
 SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 STATE_KEY_RE = re.compile(r"^[^/]+/release-state/(v[0-9]+\.[0-9]+\.[0-9]+)/[^/]+$")
+COMMAND_TIMEOUT_SECONDS = 300
 
 
 def run_bytes(command):
-  result = subprocess.run(command, check=False, capture_output=True)
+  try:
+    result = subprocess.run(
+      command,
+      check=False,
+      capture_output=True,
+      timeout=COMMAND_TIMEOUT_SECONDS,
+    )
+  except subprocess.TimeoutExpired as error:
+    raise ValueError(
+      "command timed out after {} seconds: {}".format(
+        COMMAND_TIMEOUT_SECONDS,
+        " ".join(command),
+      )
+    ) from error
   if result.returncode != 0:
     message = result.stderr.decode(errors="replace").strip()
     raise ValueError(message or "command failed: {}".format(" ".join(command)))
@@ -49,10 +63,34 @@ def verify_archive(release, repository, github_repository, drive_remote, rclone,
   if not isinstance(expected_size, int) or isinstance(expected_size, bool) or expected_size <= 0:
     raise ValueError("{} has an invalid release size".format(label))
 
+  release_assets = run_bytes([
+    gh,
+    "api",
+    "repos/{}/releases/{}/assets".format(github_repository, release_id),
+  ])
+  try:
+    release_assets = json.loads(release_assets)
+  except json.JSONDecodeError as error:
+    raise ValueError("{} GitHub release assets response is not JSON".format(label)) from error
+  if not isinstance(release_assets, list):
+    raise ValueError("{} GitHub release assets response is not an array".format(label))
+  matching_asset = next(
+    (
+      asset
+      for asset in release_assets
+      if isinstance(asset, dict) and str(asset.get("id", "")) == asset_id
+    ),
+    None,
+  )
+  if not isinstance(matching_asset, dict):
+    raise ValueError("{} GitHub asset is not attached to the recorded release".format(label))
+  if matching_asset.get("name") != archive.get("github_asset_name"):
+    raise ValueError("{} GitHub asset name differs from metadata".format(label))
+
   github_bytes = run_bytes([
     gh,
     "api",
-    "repos/{}/releases/{}/assets/{}".format(github_repository, release_id, asset_id),
+    "repos/{}/releases/assets/{}".format(github_repository, asset_id),
     "--header",
     "Accept: application/octet-stream",
   ])

@@ -72,6 +72,9 @@ class RetentionEvidenceTests(unittest.TestCase):
     }), encoding="utf-8")
     return manifest, contents
 
+  def github_asset_listing(self):
+    return json.dumps([{"id": 202, "name": "kindow-1.2.3.zip"}]).encode()
+
   def test_verified_drive_bytes_and_reachable_git_tombstone_are_accepted(self):
     manifest, contents, tombstone = self.fixture()
 
@@ -102,7 +105,11 @@ class RetentionEvidenceTests(unittest.TestCase):
   def test_verified_github_asset_and_drive_bytes_are_returned_as_archive_evidence(self):
     manifest, contents = self.archive_fixture()
 
-    with patch.object(VERIFY, "run_bytes", side_effect=[contents, contents]) as run:
+    with patch.object(
+      VERIFY,
+      "run_bytes",
+      side_effect=[self.github_asset_listing(), contents, contents],
+    ) as run:
       evidence = VERIFY.verify(
         manifest,
         Path("."),
@@ -115,18 +122,30 @@ class RetentionEvidenceTests(unittest.TestCase):
     self.assertEqual(evidence["archives"][0]["verified"], True)
     self.assertEqual(run.call_args_list[0].args[0][0:2], ["gh", "api"])
     self.assertEqual(
-      run.call_args_list[1].args[0],
+      run.call_args_list[0].args[0][2],
+      "repos/Keyflowy/kindow/releases/101/assets",
+    )
+    self.assertEqual(
+      run.call_args_list[1].args[0][2],
+      "repos/Keyflowy/kindow/releases/assets/202",
+    )
+    self.assertEqual(
+      run.call_args_list[2].args[0],
       ["rclone", "cat", "gd_admin:keyflowy/apps/kindow/releases/v1.2.3/kindow-1.2.3.zip"],
     )
 
   def test_github_asset_checksum_mismatch_fails_closed(self):
     manifest, contents = self.archive_fixture()
 
-    with patch.object(VERIFY, "run_bytes", side_effect=[b"wrong", contents]) as run:
+    with patch.object(
+      VERIFY,
+      "run_bytes",
+      side_effect=[self.github_asset_listing(), b"wrong", contents],
+    ) as run:
       with self.assertRaisesRegex(ValueError, "GitHub or Drive archive checksum or size differs"):
         VERIFY.verify(manifest, Path("."), "gd_admin:", "rclone", "Keyflowy/kindow", "gh")
 
-    self.assertEqual(run.call_count, 2)
+    self.assertEqual(run.call_count, 3)
 
 
 if __name__ == "__main__":
