@@ -79,6 +79,9 @@ jobs:
           path: .release-infrastructure
           persist-credentials: false
 
+      - name: Import home runner network environment
+        run: bash .release-infrastructure/scripts/ci/import-home-runner-env.sh "$GITHUB_ENV"
+
       - name: Validate runner-local rclone configuration
         env:
           RCLONE_REMOTE: ${{ inputs.rclone_remote }}

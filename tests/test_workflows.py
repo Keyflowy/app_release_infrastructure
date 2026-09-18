@@ -19,6 +19,8 @@ class RetentionWorkflowTests(unittest.TestCase):
     self.assertIn("cf_r2:", workflow)
     self.assertIn("gd_admin:", workflow)
     self.assertIn("rclone lsd", workflow)
+    self.assertIn("Import home runner network environment", workflow)
+    self.assertIn("import-home-runner-env.sh", workflow)
     self.assertNotIn("RCLONE_CONFIG", workflow)
     self.assertNotIn("sudo apt-get install --yes rclone", workflow)
 

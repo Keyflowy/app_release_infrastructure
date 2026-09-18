@@ -62,6 +62,9 @@ jobs:
           # reusable workflow; do not resolve the planner from a mutable branch.
           ref: ${{ job.workflow_sha }}
 
+      - name: Import home runner network environment
+        run: bash .release-infrastructure/scripts/ci/import-home-runner-env.sh "$GITHUB_ENV"
+
       - name: Validate runner-local rclone configuration
         if: ${{ inputs.inventory == '' && inputs.rclone_remote != '' }}
         env:
