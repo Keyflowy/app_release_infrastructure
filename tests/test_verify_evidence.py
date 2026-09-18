@@ -82,7 +82,8 @@ class RetentionEvidenceTests(unittest.TestCase):
       VERIFY.verify(manifest, Path("."), "gd_admin:", "rclone")
 
     self.assertEqual(run.call_count, 2)
-    self.assertEqual(run.call_args_list[0].args[0][0:2], ["rclone", "cat"])
+    self.assertEqual(run.call_args_list[0].args[0][0], "rclone")
+    self.assertIn("cat", run.call_args_list[0].args[0])
     self.assertEqual(run.call_args_list[1].args[0][0:3], ["git", "-C", "."])
 
   def test_drive_checksum_mismatch_fails_closed_before_git_is_consulted(self):
@@ -131,7 +132,12 @@ class RetentionEvidenceTests(unittest.TestCase):
     )
     self.assertEqual(
       run.call_args_list[2].args[0],
-      ["rclone", "cat", "gd_admin:keyflowy/apps/kindow/releases/v1.2.3/kindow-1.2.3.zip"],
+      [
+        "rclone",
+        *VERIFY.RCLONE_TIMEOUT_FLAGS,
+        "cat",
+        "gd_admin:keyflowy/apps/kindow/releases/v1.2.3/kindow-1.2.3.zip",
+      ],
     )
 
   def test_github_asset_checksum_mismatch_fails_closed(self):

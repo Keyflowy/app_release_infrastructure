@@ -13,6 +13,12 @@ from pathlib import Path
 SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 STATE_KEY_RE = re.compile(r"^[^/]+/release-state/(v[0-9]+\.[0-9]+\.[0-9]+)/[^/]+$")
 COMMAND_TIMEOUT_SECONDS = 300
+RCLONE_TIMEOUT_FLAGS = (
+  "--timeout", "45s",
+  "--contimeout", "10s",
+  "--retries", "2",
+  "--low-level-retries", "2",
+)
 
 
 def run_bytes(command):
@@ -40,6 +46,10 @@ def remote_object(remote, object_key):
   if remote.endswith(":") or remote.endswith("/"):
     return remote + object_key
   return remote + "/" + object_key
+
+
+def rclone_cat(rclone, object_path):
+  return run_bytes([rclone, *RCLONE_TIMEOUT_FLAGS, "cat", object_path])
 
 
 def verify_archive(release, repository, github_repository, drive_remote, rclone, gh):
@@ -100,7 +110,7 @@ def verify_archive(release, repository, github_repository, drive_remote, rclone,
   drive_key = archive.get("drive_object_key")
   if not isinstance(drive_key, str) or not drive_key:
     raise ValueError("{} has an invalid Drive object key".format(label))
-  drive_bytes = run_bytes([rclone, "cat", remote_object(drive_remote, drive_key)])
+  drive_bytes = rclone_cat(rclone, remote_object(drive_remote, drive_key))
   drive_checksum = "sha256:" + hashlib.sha256(drive_bytes).hexdigest()
   drive_size = len(drive_bytes)
 
@@ -181,7 +191,7 @@ def verify(
       raise ValueError("{} Drive object key is invalid".format(label))
     drive_identity = (drive_object_key, checksum, size_bytes)
     if drive_identity not in verified_drive_objects:
-      contents = run_bytes([rclone, "cat", drive_remote + drive_object_key])
+      contents = rclone_cat(rclone, drive_remote + drive_object_key)
       actual_checksum = "sha256:" + hashlib.sha256(contents).hexdigest()
       if len(contents) != size_bytes or actual_checksum != checksum:
         raise ValueError("{} Drive backup checksum or size differs".format(label))
