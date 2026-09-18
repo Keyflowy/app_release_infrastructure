@@ -505,6 +505,7 @@ def validate_retention_metadata(value: Any, label: str) -> Dict[str, Any]:
 def archive_is_verified(
   descriptor: Artifact,
   inventory_object: Optional[InventoryObject] = None,
+  evidence_keys: FrozenSet[str] = frozenset(),
 ) -> bool:
   archive = descriptor.archive
   if descriptor.kind != "stable-installer" or archive is None:
@@ -512,6 +513,8 @@ def archive_is_verified(
   if descriptor.checksum is None or descriptor.size_bytes is None:
     return False
   if not SHA256_RE.fullmatch(descriptor.checksum):
+    return False
+  if descriptor.key not in evidence_keys:
     return False
   manifest_matches = (
     archive.get("verified") is True
@@ -547,6 +550,72 @@ def metadata_is_verified(
   if inventory_sha256 is not None and inventory_sha256 != descriptor.checksum.removeprefix("sha256:"):
     return False
   return True
+
+
+def load_archive_evidence(
+  path: Path,
+  manifest_path: Path,
+  artifacts: Dict[str, List[Artifact]],
+) -> FrozenSet[str]:
+  """Validate live GitHub/Drive archive checks before allowing deletion."""
+  evidence = load_json(path)
+  if not isinstance(evidence, dict):
+    raise ValueError("archive evidence must be a JSON object")
+  if evidence.get("schema_version") != 1:
+    raise ValueError("unsupported archive evidence schema_version")
+  manifest_digest = evidence.get("manifest_sha256")
+  expected_manifest_digest = "sha256:" + sha256_file(manifest_path)
+  if manifest_digest != expected_manifest_digest:
+    raise ValueError("archive evidence manifest digest does not match the plan manifest")
+  entries = evidence.get("archives")
+  if not isinstance(entries, list):
+    raise ValueError("archive evidence archives must be an array")
+
+  archive_descriptors = {
+    descriptor.key: descriptor
+    for descriptors in artifacts.values()
+    for descriptor in descriptors
+    if descriptor.archive is not None
+  }
+  verified_keys = set()
+  for index, entry in enumerate(entries):
+    label = "archive evidence archives[{}]".format(index)
+    if not isinstance(entry, dict):
+      raise ValueError("{} must be an object".format(label))
+    key = require_key(entry.get("full_zip_object_key"), label + ".full_zip_object_key")
+    if key in verified_keys:
+      raise ValueError("duplicate archive evidence for {}".format(key))
+    descriptor = archive_descriptors.get(key)
+    if descriptor is None or descriptor.archive is None:
+      raise ValueError("{} does not match a manifest archive".format(label))
+    archive = descriptor.archive
+    if (
+      entry.get("version") is None
+      or entry.get("version") != ".".join(str(part) for part in descriptor.version or ())
+      or entry.get("github_release_id") != archive.get("github_release_id")
+      or entry.get("github_asset_id") != archive.get("github_asset_id")
+      or entry.get("github_asset_name") != archive.get("github_asset_name")
+      or entry.get("drive_object_key") != archive.get("drive_object_key")
+      or entry.get("verified") is not True
+    ):
+      raise ValueError("{} identity does not match the manifest archive".format(label))
+    github_checksum = require_sha256(entry.get("github_asset_sha256"), label + ".github_asset_sha256")
+    drive_checksum = require_sha256(entry.get("drive_sha256"), label + ".drive_sha256")
+    github_size = require_positive_integer(entry.get("github_asset_size_bytes"), label + ".github_asset_size_bytes")
+    drive_size = require_positive_integer(entry.get("drive_size_bytes"), label + ".drive_size_bytes")
+    if (
+      github_checksum != descriptor.checksum
+      or drive_checksum != descriptor.checksum
+      or github_size != descriptor.size_bytes
+      or drive_size != descriptor.size_bytes
+    ):
+      raise ValueError("{} checksum or size does not match the manifest archive".format(label))
+    verified_keys.add(key)
+
+  missing = sorted(set(archive_descriptors).difference(verified_keys))
+  if missing:
+    raise ValueError("archive evidence is missing manifest archive {}".format(missing[0]))
+  return frozenset(verified_keys)
 
 
 def parse_inventory_value(raw: Any) -> List[InventoryObject]:
@@ -899,6 +968,7 @@ def decide_descriptor(
   appcast_references: FrozenSet[str] = frozenset(),
   metadata_cutoff: Optional[date] = None,
   inventory_object: Optional[InventoryObject] = None,
+  archive_evidence_keys: FrozenSet[str] = frozenset(),
 ) -> Tuple[str, str]:
   if descriptor.kind == "protected-metadata":
     return "keep", "protected-metadata"
@@ -922,7 +992,7 @@ def decide_descriptor(
     if descriptor.release_date is not None and descriptor.release_date >= recent_cutoff:
       return "keep", "recent-stable"
     if archive_policy:
-      if archive_is_verified(descriptor, inventory_object):
+      if archive_is_verified(descriptor, inventory_object, archive_evidence_keys):
         return "delete", "archived-stable-expired"
       return "keep", "awaiting-archive-verification"
     if (
@@ -1000,6 +1070,7 @@ def build_plan(
   r2_prefix: Optional[str] = None,
   plan_ttl_hours: int = 24,
   appcast_path: Optional[Path] = None,
+  archive_evidence_path: Optional[Path] = None,
   appcast_references: Optional[Sequence[str]] = None,
   max_delete_objects: Optional[int] = None,
   max_delete_bytes: Optional[int] = None,
@@ -1022,6 +1093,21 @@ def build_plan(
     and appcast_path is None
   ):
     raise ValueError("policy v2 complete plans require a live appcast snapshot")
+  archive_descriptors = {
+    descriptor.key
+    for descriptors in artifacts.values()
+    for descriptor in descriptors
+    if descriptor.archive is not None
+  }
+  archive_evidence_keys = frozenset()
+  if archive_policy and inventory_path is not None and archive_descriptors:
+    if archive_evidence_path is None:
+      raise ValueError("policy v2 complete plans require archive evidence")
+    archive_evidence_keys = load_archive_evidence(
+      archive_evidence_path,
+      manifest_path,
+      artifacts,
+    )
   excluded_prefixes = list(policy.get("excluded_prefixes", []))
   cache_prefix = policy.get("fallback_cache_prefix", "")
   if cache_prefix and cache_prefix not in excluded_prefixes:
@@ -1086,6 +1172,7 @@ def build_plan(
         frozenset(parsed_appcast_references),
         metadata_cutoff,
         item,
+        archive_evidence_keys,
       )
       for descriptor in descriptors
     ]
@@ -1137,6 +1224,7 @@ def build_plan(
     "excluded_prefixes": excluded_prefixes,
     "appcast_references": sorted(parsed_appcast_references),
     "appcast_sha256": sha256_file(appcast_path) if appcast_path is not None else None,
+    "archive_evidence_sha256": sha256_file(archive_evidence_path) if archive_evidence_path is not None else None,
     "manifest_sha256": sha256_file(manifest_path),
     "policy_sha256": sha256_file(policy_path),
     "inventory_sha256": inventory_digest(inventory),
@@ -1204,6 +1292,11 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     type=Path,
     help="snapshot of the live appcast whose enclosure and delta objects must be retained",
   )
+  parser.add_argument(
+    "--archive-evidence",
+    type=Path,
+    help="evidence from re-reading every manifest archive in GitHub Releases and Drive",
+  )
   parser.add_argument("--max-delete-objects", type=int)
   parser.add_argument("--max-delete-bytes", type=int)
   parser.add_argument(
@@ -1227,6 +1320,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
       args.r2_prefix,
       args.plan_ttl_hours,
       args.appcast,
+      args.archive_evidence,
       None,
       args.max_delete_objects,
       args.max_delete_bytes,

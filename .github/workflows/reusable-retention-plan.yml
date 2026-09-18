@@ -136,13 +136,17 @@ jobs:
 
       - name: Verify archive-backed retention evidence
         if: ${{ inputs.rclone_remote != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           python3 .release-infrastructure/scripts/release-retention/verify_evidence.py \
             --manifest "${{ inputs.manifest }}" \
             --repository "$GITHUB_WORKSPACE" \
+            --github-repository "$GITHUB_REPOSITORY" \
             --drive-remote gd_admin: \
-            --rclone rclone
+            --rclone rclone \
+            --output "$RUNNER_TEMP/release-retention-archive-evidence.json"
 
       - name: Snapshot live appcast
         id: appcast
@@ -182,6 +186,7 @@ jobs:
           RCLONE_REMOTE: ${{ inputs.rclone_remote }}
           R2_PREFIX: ${{ inputs.r2_prefix }}
           APPCAST_PATH: ${{ steps.appcast.outputs.path }}
+          ARCHIVE_EVIDENCE_PATH: ${{ runner.temp }}/release-retention-archive-evidence.json
         run: |
           set -euo pipefail
 
@@ -206,6 +211,10 @@ jobs:
 
           if [ -n "$APPCAST_PATH" ]; then
             args+=(--appcast "$APPCAST_PATH")
+          fi
+
+          if [ -f "$ARCHIVE_EVIDENCE_PATH" ]; then
+            args+=(--archive-evidence "$ARCHIVE_EVIDENCE_PATH")
           fi
 
           python3 .release-infrastructure/scripts/release-retention/plan.py "${args[@]}"

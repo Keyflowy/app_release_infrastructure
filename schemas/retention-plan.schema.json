@@ -18,6 +18,7 @@
     "excluded_prefixes",
     "appcast_references",
     "appcast_sha256",
+    "archive_evidence_sha256",
     "manifest_sha256",
     "policy_sha256",
     "inventory_sha256",
@@ -50,6 +51,12 @@
       "uniqueItems": true
     },
     "appcast_sha256": {
+      "anyOf": [
+        {"$ref": "#/$defs/sha256"},
+        {"type": "null"}
+      ]
+    },
+    "archive_evidence_sha256": {
       "anyOf": [
         {"$ref": "#/$defs/sha256"},
         {"type": "null"}

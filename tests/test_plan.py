@@ -108,6 +108,31 @@ class ReleaseRetentionPlanTests(unittest.TestCase):
     appcast_path.write_text("<rss><channel>{}</channel></rss>".format(items), encoding="utf-8")
     return appcast_path
 
+  def write_archive_evidence(self, manifest_path, releases):
+    entries = []
+    for release_item in releases:
+      archive = release_item["archive"]
+      entries.append({
+        "version": release_item["version"],
+        "full_zip_object_key": release_item["full_zip_object_key"],
+        "github_release_id": archive["github_release_id"],
+        "github_asset_id": archive["github_asset_id"],
+        "github_asset_name": archive["github_asset_name"],
+        "github_asset_sha256": release_item["checksum"],
+        "github_asset_size_bytes": release_item["size_bytes"],
+        "drive_object_key": archive["drive_object_key"],
+        "drive_sha256": release_item["checksum"],
+        "drive_size_bytes": release_item["size_bytes"],
+        "verified": True,
+      })
+    evidence_path = manifest_path.parent / "archive-evidence.json"
+    evidence_path.write_text(json.dumps({
+      "schema_version": 1,
+      "manifest_sha256": "sha256:" + plan.sha256_file(manifest_path),
+      "archives": entries,
+    }), encoding="utf-8")
+    return evidence_path
+
   def decisions(self, result):
     values = {}
     for item in result["keep"]:
@@ -472,7 +497,6 @@ class ReleaseRetentionPlanTests(unittest.TestCase):
       manifest,
       [{"key": old_release["full_zip_object_key"], "size_bytes": 10}],
     )
-
     result = plan.build_plan(manifest_path, policy, inventory_path, AS_OF)
 
     self.assertEqual(
@@ -493,13 +517,64 @@ class ReleaseRetentionPlanTests(unittest.TestCase):
       manifest,
       [{"key": old_release["full_zip_object_key"], "size_bytes": 10}],
     )
+    evidence_path = self.write_archive_evidence(manifest_path, [old_release])
 
-    result = plan.build_plan(manifest_path, policy, inventory_path, AS_OF)
+    result = plan.build_plan(
+      manifest_path,
+      policy,
+      inventory_path,
+      AS_OF,
+      archive_evidence_path=evidence_path,
+    )
 
     self.assertEqual(
       self.decisions(result)[old_release["full_zip_object_key"]],
       ("delete", "archived-stable-expired"),
     )
+
+  def test_v2_complete_plan_fails_closed_when_archive_evidence_is_missing(self):
+    policy = self.write_v2_policy()
+    old_release = archived_release("3.1.0", "2024-01-01")
+    manifest = {
+      "schema_version": 1,
+      "product": "kindow",
+      "generated_at": "2026-08-26T00:00:00Z",
+      "releases": [old_release],
+    }
+    manifest_path, inventory_path = self.write_fixture(
+      manifest,
+      [{"key": old_release["full_zip_object_key"], "size_bytes": 10}],
+    )
+
+    with self.assertRaisesRegex(ValueError, "require archive evidence"):
+      plan.build_plan(manifest_path, policy, inventory_path, AS_OF)
+
+  def test_v2_complete_plan_fails_closed_when_archive_evidence_mismatches(self):
+    policy = self.write_v2_policy()
+    old_release = archived_release("3.1.0", "2024-01-01")
+    manifest = {
+      "schema_version": 1,
+      "product": "kindow",
+      "generated_at": "2026-08-26T00:00:00Z",
+      "releases": [old_release],
+    }
+    manifest_path, inventory_path = self.write_fixture(
+      manifest,
+      [{"key": old_release["full_zip_object_key"], "size_bytes": 10}],
+    )
+    evidence_path = self.write_archive_evidence(manifest_path, [old_release])
+    evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+    evidence["archives"][0]["drive_sha256"] = "sha256:" + "f" * 64
+    evidence_path.write_text(json.dumps(evidence), encoding="utf-8")
+
+    with self.assertRaisesRegex(ValueError, "checksum or size does not match"):
+      plan.build_plan(
+        manifest_path,
+        policy,
+        inventory_path,
+        AS_OF,
+        archive_evidence_path=evidence_path,
+      )
 
   def test_v2_keeps_an_archived_installer_when_r2_size_or_sha256_differs(self):
     policy = self.write_v2_policy()
@@ -521,7 +596,14 @@ class ReleaseRetentionPlanTests(unittest.TestCase):
     for inventory in mismatches:
       with self.subTest(inventory=inventory):
         manifest_path, inventory_path = self.write_fixture(manifest, [inventory])
-        result = plan.build_plan(manifest_path, policy, inventory_path, AS_OF)
+        evidence_path = self.write_archive_evidence(manifest_path, [old_release])
+        result = plan.build_plan(
+          manifest_path,
+          policy,
+          inventory_path,
+          AS_OF,
+          archive_evidence_path=evidence_path,
+        )
         self.assertEqual(
           self.decisions(result)[old_release["full_zip_object_key"]],
           ("keep", "awaiting-archive-verification"),
@@ -544,6 +626,7 @@ class ReleaseRetentionPlanTests(unittest.TestCase):
       {"key": old_release["sparkle_delta_object_keys"][0], "size_bytes": 2},
     ]
     manifest_path, inventory_path = self.write_fixture(manifest, inventory)
+    evidence_path = self.write_archive_evidence(manifest_path, [old_release])
     appcast_path = self.write_appcast(
       manifest_path.parent,
       [
@@ -560,6 +643,7 @@ class ReleaseRetentionPlanTests(unittest.TestCase):
       "cf_r2:keyflowy-apps/",
       "kindow/",
       appcast_path=appcast_path,
+      archive_evidence_path=evidence_path,
     )
 
     decisions = self.decisions(result)
@@ -638,13 +722,26 @@ class ReleaseRetentionPlanTests(unittest.TestCase):
       for item in releases
     ]
     manifest_path, inventory_path = self.write_fixture(manifest, inventory)
+    evidence_path = self.write_archive_evidence(manifest_path, releases)
 
-    first = plan.build_plan(manifest_path, policy, inventory_path, AS_OF)
+    first = plan.build_plan(
+      manifest_path,
+      policy,
+      inventory_path,
+      AS_OF,
+      archive_evidence_path=evidence_path,
+    )
 
     self.assertEqual([item["key"] for item in first["delete"]], ["kindow/releases/3.1.0.zip"])
     self.assertEqual(first["summary"]["deferred_count"], 1)
     inventory_path.write_text(json.dumps({"objects": [inventory[1]]}), encoding="utf-8")
-    second = plan.build_plan(manifest_path, policy, inventory_path, AS_OF)
+    second = plan.build_plan(
+      manifest_path,
+      policy,
+      inventory_path,
+      AS_OF,
+      archive_evidence_path=evidence_path,
+    )
     self.assertEqual([item["key"] for item in second["delete"]], ["kindow/releases/3.1.1.zip"])
 
   def test_v2_deletes_old_metadata_only_with_drive_and_git_completion_evidence(self):
