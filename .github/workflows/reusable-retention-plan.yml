@@ -45,6 +45,8 @@ jobs:
       plan_sha256: ${{ steps.digest.outputs.sha256 }}
     runs-on: [self-hosted, Linux, home]
     timeout-minutes: 30
+    env:
+      KINDOW_RUNNER_NETWORK_PROFILE: linux-home
     permissions:
       contents: read
     steps:
@@ -63,7 +65,8 @@ jobs:
           ref: ${{ job.workflow_sha }}
 
       - name: Import home runner network environment
-        run: bash .release-infrastructure/scripts/ci/import-home-runner-env.sh "$GITHUB_ENV"
+        if: ${{ runner.os == 'Linux' && env.KINDOW_RUNNER_NETWORK_PROFILE == 'linux-home' }}
+        uses: ./.release-infrastructure/.github/actions/import-home-runner-env
 
       - name: Validate runner-local rclone configuration
         if: ${{ inputs.inventory == '' && inputs.rclone_remote != '' }}
