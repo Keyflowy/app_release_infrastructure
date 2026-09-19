@@ -1,0 +1,8 @@
+name: Import home Linux runner environment
+description: Import proxy and HOME settings from the runner user's login shell
+runs:
+  using: composite
+  steps:
+    - name: Import login-shell environment
+      shell: bash
+      run: bash "$GITHUB_ACTION_PATH/import-home-runner-env.sh" "$GITHUB_ENV"
