@@ -135,7 +135,7 @@ jobs:
           echo "path=$inventory_path" >> "$GITHUB_OUTPUT"
           echo "complete=true" >> "$GITHUB_OUTPUT"
 
-      - name: Verify archive-backed retention evidence
+      - name: Verify archive-backed retention metadata
         if: ${{ inputs.rclone_remote != '' }}
         env:
           GH_TOKEN: ${{ github.token }}
