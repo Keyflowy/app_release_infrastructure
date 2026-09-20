@@ -46,8 +46,12 @@ candidate is the only tolerated drift and is recorded as `already-absent`.
 
 Protected metadata, live appcast references, unarchived stable installers, and
 unknown objects are never deletion candidates. Under policy v2, release-state
-metadata is eligible only after the plan workflow verifies its Drive backup and
-Git completion tombstone. The apply command performs one
+metadata is eligible only after the plan workflow verifies its Drive MD5/size
+metadata and Git completion tombstone. Archive-backed installers use GitHub
+asset `digest`, Drive MD5/size, and the manifest as the normal plan evidence;
+the plan does not download historical ZIPs. Immediately before any deletion,
+apply deeply hashes every candidate archive copy (GitHub and Drive) and every
+release-state backup, and aborts the whole batch if any deep check fails. The apply command performs one
 `rclone deletefile` per candidate, never a recursive delete, and stops after
 the first unexpected failure. It writes an audit result for every attempted
 object and can be retried only with the same approved plan.

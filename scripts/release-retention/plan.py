@@ -92,9 +92,11 @@ ARCHIVE_FIELDS = frozenset({
   "github_asset_id",
   "github_asset_name",
   "github_asset_sha256",
+  "github_asset_digest",
   "github_asset_size_bytes",
   "drive_object_key",
   "drive_sha256",
+  "drive_md5",
   "drive_size_bytes",
   "verified",
 })
@@ -113,6 +115,7 @@ METADATA_FIELDS = frozenset({
 BACKUP_FIELDS = frozenset({
   "drive_object_key",
   "sha256",
+  "md5",
   "size_bytes",
   "verified",
 })
@@ -403,6 +406,12 @@ def require_sha256(value: Any, label: str) -> str:
   return value
 
 
+def require_md5(value: Any, label: str) -> str:
+  if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{32}", value.lower()) is None:
+    raise ValueError("{} must be a 32-character lowercase MD5 checksum".format(label))
+  return value.lower()
+
+
 def require_positive_integer(value: Any, label: str) -> int:
   if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
     raise ValueError("{} must be a positive integer".format(label))
@@ -413,7 +422,17 @@ def validate_archive(value: Any, label: str) -> Dict[str, Any]:
   if not isinstance(value, dict):
     raise ValueError("{} must be an object".format(label))
   reject_unknown_fields(value, ARCHIVE_FIELDS, label)
-  require_fields(value, ARCHIVE_FIELDS, label)
+  require_fields(value, {
+    "github_release_id",
+    "github_asset_id",
+    "github_asset_name",
+    "github_asset_sha256",
+    "github_asset_size_bytes",
+    "drive_object_key",
+    "drive_sha256",
+    "drive_size_bytes",
+    "verified",
+  }, label)
 
   for field in ("github_release_id", "github_asset_id"):
     identifier = value[field]
@@ -425,7 +444,11 @@ def validate_archive(value: Any, label: str) -> Dict[str, Any]:
   if not isinstance(asset_name, str) or not asset_name or "/" in asset_name or "\\" in asset_name:
     raise ValueError("{}.github_asset_name must be a file name".format(label))
   require_sha256(value["github_asset_sha256"], label + ".github_asset_sha256")
+  if "github_asset_digest" in value:
+    require_sha256(value["github_asset_digest"], label + ".github_asset_digest")
   require_sha256(value["drive_sha256"], label + ".drive_sha256")
+  if "drive_md5" in value:
+    require_md5(value["drive_md5"], label + ".drive_md5")
   require_positive_integer(value["github_asset_size_bytes"], label + ".github_asset_size_bytes")
   require_positive_integer(value["drive_size_bytes"], label + ".drive_size_bytes")
   require_key(value["drive_object_key"], label + ".drive_object_key")
@@ -444,9 +467,11 @@ def validate_metadata_backup(value: Any, label: str) -> Dict[str, Any]:
   if not isinstance(value, dict):
     raise ValueError("{} must be an object".format(label))
   reject_unknown_fields(value, BACKUP_FIELDS, label)
-  require_fields(value, BACKUP_FIELDS, label)
+  require_fields(value, {"drive_object_key", "sha256", "size_bytes", "verified"}, label)
   require_key(value["drive_object_key"], label + ".drive_object_key")
   require_sha256(value["sha256"], label + ".sha256")
+  if "md5" in value:
+    require_md5(value["md5"], label + ".md5")
   require_positive_integer(value["size_bytes"], label + ".size_bytes")
   if not isinstance(value["verified"], bool):
     raise ValueError("{}.verified must be boolean".format(label))
@@ -557,11 +582,12 @@ def load_archive_evidence(
   manifest_path: Path,
   artifacts: Dict[str, List[Artifact]],
 ) -> FrozenSet[str]:
-  """Validate live GitHub/Drive archive checks before allowing deletion."""
+  """Validate live GitHub/Drive metadata before allowing deletion."""
   evidence = load_json(path)
   if not isinstance(evidence, dict):
     raise ValueError("archive evidence must be a JSON object")
-  if evidence.get("schema_version") != 1:
+  evidence_version = evidence.get("schema_version")
+  if evidence_version not in (1, 2):
     raise ValueError("unsupported archive evidence schema_version")
   manifest_digest = evidence.get("manifest_sha256")
   expected_manifest_digest = "sha256:" + sha256_file(manifest_path)
@@ -599,17 +625,30 @@ def load_archive_evidence(
       or entry.get("verified") is not True
     ):
       raise ValueError("{} identity does not match the manifest archive".format(label))
-    github_checksum = require_sha256(entry.get("github_asset_sha256"), label + ".github_asset_sha256")
-    drive_checksum = require_sha256(entry.get("drive_sha256"), label + ".drive_sha256")
     github_size = require_positive_integer(entry.get("github_asset_size_bytes"), label + ".github_asset_size_bytes")
     drive_size = require_positive_integer(entry.get("drive_size_bytes"), label + ".drive_size_bytes")
-    if (
-      github_checksum != descriptor.checksum
-      or drive_checksum != descriptor.checksum
-      or github_size != descriptor.size_bytes
-      or drive_size != descriptor.size_bytes
-    ):
-      raise ValueError("{} checksum or size does not match the manifest archive".format(label))
+    if evidence_version == 1:
+      github_checksum = require_sha256(entry.get("github_asset_sha256"), label + ".github_asset_sha256")
+      drive_checksum = require_sha256(entry.get("drive_sha256"), label + ".drive_sha256")
+      if (
+        github_checksum != descriptor.checksum
+        or drive_checksum != descriptor.checksum
+        or github_size != descriptor.size_bytes
+        or drive_size != descriptor.size_bytes
+      ):
+        raise ValueError("{} checksum or size does not match the manifest archive".format(label))
+    else:
+      github_digest = require_sha256(entry.get("github_asset_digest"), label + ".github_asset_digest")
+      drive_md5 = require_md5(entry.get("drive_md5"), label + ".drive_md5")
+      archive = descriptor.archive
+      if (
+        github_digest != archive.get("github_asset_digest")
+        or drive_md5 != archive.get("drive_md5", "").lower()
+        or github_digest != descriptor.checksum
+        or github_size != descriptor.size_bytes
+        or drive_size != descriptor.size_bytes
+      ):
+        raise ValueError("{} metadata or size does not match the manifest archive".format(label))
     verified_keys.add(key)
 
   missing = sorted(set(archive_descriptors).difference(verified_keys))
@@ -1295,7 +1334,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
   parser.add_argument(
     "--archive-evidence",
     type=Path,
-    help="evidence from re-reading every manifest archive in GitHub Releases and Drive",
+    help="metadata evidence from GitHub Releases and Drive for every manifest archive",
   )
   parser.add_argument("--max-delete-objects", type=int)
   parser.add_argument("--max-delete-bytes", type=int)

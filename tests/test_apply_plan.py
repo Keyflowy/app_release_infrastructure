@@ -367,6 +367,36 @@ class RetentionApplyTests(unittest.TestCase):
     self.assertEqual(code, 1)
     run.assert_not_called()
 
+  def test_archive_candidates_are_deep_checked_before_any_dry_run_or_delete(self):
+    path, retention_plan, plan_path, manifest_path = self.fixture()
+    retention_plan["delete"][0]["reason"] = "archived-stable-expired"
+    retention_plan.pop("plan_id")
+    retention_plan["plan_id"] = plan.canonical_sha256(retention_plan)
+    plan_path.write_text(json.dumps(retention_plan), encoding="utf-8")
+    objects = [inventory_item("3.1.0", 10, "old"), inventory_item("3.1.4", 20, "new")]
+    with (
+      patch("apply_plan.verify_archive_bytes", side_effect=apply_plan.ApplyError("archive corrupt")) as verify,
+      patch("apply_plan.subprocess.run", side_effect=lambda args, **kwargs: CompletedProcess(
+        args=args,
+        returncode=0,
+        stdout=self.lsjson(objects) if args[1] == "lsjson" else "",
+        stderr="",
+      )) as run,
+    ):
+      code = apply_plan.main([
+        "--plan", str(plan_path),
+        "--expected-plan-sha256", retention_plan["plan_id"],
+        "--product", "kindow",
+        "--rclone-remote", REMOTE,
+        "--r2-prefix", PREFIX,
+        "--manifest", str(manifest_path),
+        "--github-repository", "Keyflowy/kindow",
+        "--now", "2026-08-26T00:00:00Z",
+      ])
+    self.assertEqual(code, 1)
+    verify.assert_called_once()
+    self.assertEqual([call.args[0][1] for call in run.call_args_list], ["lsjson"])
+
 
 if __name__ == "__main__":
   unittest.main()

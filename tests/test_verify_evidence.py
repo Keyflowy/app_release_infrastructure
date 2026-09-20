@@ -22,6 +22,7 @@ class RetentionEvidenceTests(unittest.TestCase):
     directory = Path(temporary.name)
     contents = b'{"release_id":"v1.2.3"}\n'
     checksum = "sha256:" + VERIFY.hashlib.sha256(contents).hexdigest()
+    md5 = VERIFY.hashlib.md5(contents).hexdigest()
     manifest = directory / "release-manifest.json"
     manifest.write_text(json.dumps({
       "retention_metadata": [{
@@ -31,6 +32,7 @@ class RetentionEvidenceTests(unittest.TestCase):
         "backup": {
           "drive_object_key": "keyflowy/apps/kindow/releases/v1.2.3/release-state/complete.json",
           "sha256": checksum,
+          "md5": md5,
           "size_bytes": len(contents),
           "verified": True,
         },
@@ -50,6 +52,7 @@ class RetentionEvidenceTests(unittest.TestCase):
     directory = Path(temporary.name)
     contents = b"release zip bytes"
     checksum = "sha256:" + VERIFY.hashlib.sha256(contents).hexdigest()
+    md5 = VERIFY.hashlib.md5(contents).hexdigest()
     manifest = directory / "release-manifest.json"
     manifest.write_text(json.dumps({
       "releases": [{
@@ -62,9 +65,11 @@ class RetentionEvidenceTests(unittest.TestCase):
           "github_asset_id": 202,
           "github_asset_name": "kindow-1.2.3.zip",
           "github_asset_sha256": checksum,
+          "github_asset_digest": checksum,
           "github_asset_size_bytes": len(contents),
           "drive_object_key": "keyflowy/apps/kindow/releases/v1.2.3/kindow-1.2.3.zip",
           "drive_sha256": checksum,
+          "drive_md5": md5,
           "drive_size_bytes": len(contents),
           "verified": True,
         },
@@ -78,19 +83,21 @@ class RetentionEvidenceTests(unittest.TestCase):
   def test_verified_drive_bytes_and_reachable_git_tombstone_are_accepted(self):
     manifest, contents, tombstone = self.fixture()
 
-    with patch.object(VERIFY, "run_bytes", side_effect=[contents, tombstone]) as run:
+    drive_metadata = json.dumps([{"Size": len(contents), "Hashes": {"md5": VERIFY.hashlib.md5(contents).hexdigest()}}]).encode()
+    with patch.object(VERIFY, "run_bytes", side_effect=[drive_metadata, tombstone]) as run:
       VERIFY.verify(manifest, Path("."), "gd_admin:", "rclone")
 
     self.assertEqual(run.call_count, 2)
     self.assertEqual(run.call_args_list[0].args[0][0], "rclone")
-    self.assertIn("cat", run.call_args_list[0].args[0])
+    self.assertIn("lsjson", run.call_args_list[0].args[0])
     self.assertEqual(run.call_args_list[1].args[0][0:3], ["git", "-C", "."])
 
   def test_drive_checksum_mismatch_fails_closed_before_git_is_consulted(self):
-    manifest, _, tombstone = self.fixture()
+    manifest, contents, tombstone = self.fixture()
 
-    with patch.object(VERIFY, "run_bytes", side_effect=[b"wrong", tombstone]) as run:
-      with self.assertRaisesRegex(ValueError, "Drive backup checksum or size differs"):
+    drive_metadata = json.dumps([{"Size": len(contents), "Hashes": {"md5": "0" * 32}}]).encode()
+    with patch.object(VERIFY, "run_bytes", side_effect=[drive_metadata, tombstone]) as run:
+      with self.assertRaisesRegex(ValueError, "Drive metadata checksum or size differs"):
         VERIFY.verify(manifest, Path("."), "gd_admin:", "rclone")
 
     self.assertEqual(run.call_count, 1)
@@ -111,7 +118,8 @@ class RetentionEvidenceTests(unittest.TestCase):
     manifest, contents, _ = self.fixture()
     wrong_tombstone = b'{"release_id":"v9.9.9","version":"9.9.9"}\n'
 
-    with patch.object(VERIFY, "run_bytes", side_effect=[contents, wrong_tombstone]):
+    drive_metadata = json.dumps([{"Size": len(contents), "Hashes": {"md5": VERIFY.hashlib.md5(contents).hexdigest()}}]).encode()
+    with patch.object(VERIFY, "run_bytes", side_effect=[drive_metadata, wrong_tombstone]):
       with self.assertRaisesRegex(ValueError, "tombstone identity differs"):
         VERIFY.verify(manifest, Path("."), "gd_admin:", "rclone")
 
@@ -121,7 +129,10 @@ class RetentionEvidenceTests(unittest.TestCase):
     with patch.object(
       VERIFY,
       "run_bytes",
-      side_effect=[self.github_asset_listing(), contents, contents],
+      side_effect=[
+        json.dumps([{"id": 202, "name": "kindow-1.2.3.zip", "digest": "sha256:" + VERIFY.hashlib.sha256(contents).hexdigest(), "size": len(contents)}]).encode(),
+        json.dumps([{"Size": len(contents), "Hashes": {"md5": VERIFY.hashlib.md5(contents).hexdigest()}}]).encode(),
+      ],
     ) as run:
       evidence = VERIFY.verify(
         manifest,
@@ -138,19 +149,7 @@ class RetentionEvidenceTests(unittest.TestCase):
       run.call_args_list[0].args[0][2],
       "repos/Keyflowy/kindow/releases/101/assets",
     )
-    self.assertEqual(
-      run.call_args_list[1].args[0][2],
-      "repos/Keyflowy/kindow/releases/assets/202",
-    )
-    self.assertEqual(
-      run.call_args_list[2].args[0],
-      [
-        "rclone",
-        *VERIFY.RCLONE_TIMEOUT_FLAGS,
-        "cat",
-        "gd_admin:keyflowy/apps/kindow/releases/v1.2.3/kindow-1.2.3.zip",
-      ],
-    )
+    self.assertIn("lsjson", run.call_args_list[1].args[0])
 
   def test_github_asset_checksum_mismatch_fails_closed(self):
     manifest, contents = self.archive_fixture()
@@ -158,12 +157,15 @@ class RetentionEvidenceTests(unittest.TestCase):
     with patch.object(
       VERIFY,
       "run_bytes",
-      side_effect=[self.github_asset_listing(), b"wrong", contents],
+      side_effect=[
+        json.dumps([{"id": 202, "name": "kindow-1.2.3.zip", "digest": "sha256:" + "f" * 64, "size": len(contents)}]).encode(),
+        json.dumps([{"Size": len(contents), "Hashes": {"md5": VERIFY.hashlib.md5(contents).hexdigest()}}]).encode(),
+      ],
     ) as run:
-      with self.assertRaisesRegex(ValueError, "GitHub or Drive archive checksum or size differs"):
+      with self.assertRaisesRegex(ValueError, "GitHub or Drive metadata differs"):
         VERIFY.verify(manifest, Path("."), "gd_admin:", "rclone", "Keyflowy/kindow", "gh")
 
-    self.assertEqual(run.call_count, 3)
+    self.assertEqual(run.call_count, 2)
 
 
 if __name__ == "__main__":

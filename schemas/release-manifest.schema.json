@@ -82,9 +82,11 @@
         "github_asset_id": {"type": ["integer", "string"]},
         "github_asset_name": {"type": "string", "minLength": 1},
         "github_asset_sha256": {"$ref": "#/$defs/sha256"},
+        "github_asset_digest": {"$ref": "#/$defs/sha256"},
         "github_asset_size_bytes": {"type": "integer", "minimum": 1},
         "drive_object_key": {"$ref": "#/$defs/objectKey"},
         "drive_sha256": {"$ref": "#/$defs/sha256"},
+        "drive_md5": {"type": "string", "pattern": "^[0-9a-fA-F]{32}$"},
         "drive_size_bytes": {"type": "integer", "minimum": 1},
         "verified": {"type": "boolean"}
       }
@@ -96,6 +98,7 @@
       "properties": {
         "drive_object_key": {"$ref": "#/$defs/objectKey"},
         "sha256": {"$ref": "#/$defs/sha256"},
+        "md5": {"type": "string", "pattern": "^[0-9a-fA-F]{32}$"},
         "size_bytes": {"type": "integer", "minimum": 1},
         "verified": {"type": "boolean"}
       }

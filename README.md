@@ -27,8 +27,8 @@ Production products may opt into policy v2 with
 `fallback_strategy = "archive-backed-exact-version"`. Under v2, the planner:
 
 - keeps recent stable installers in R2 as the hot update layer;
-- deletes an expired stable installer only when its GitHub Release and Google
-  Drive copies have matching SHA-256 and size evidence;
+- deletes an expired stable installer only when its GitHub Release digest and
+  Google Drive MD5/size metadata match the manifest;
 - protects every installer and delta referenced by the live R2 appcast;
 - ages release-state metadata only after its Drive bytes and committed Git
   completion tombstone have been verified by the reusable workflow;
@@ -55,8 +55,10 @@ an apply workflow. Consumers should pin the shared workflow to a reviewed
 release tag once the repository's first release is published. Do not use a
 mutable branch for production callers.
 For policy v2 it also snapshots the current R2 appcast, verifies every declared
-Drive backup byte-for-byte, and proves each Git completion tombstone exists at
-the declared commit before producing a plan.
+archive and Drive backup from remote metadata (GitHub `digest`, Drive MD5 and
+size), and proves each Git completion tombstone exists at the declared commit
+before producing a plan. Historical ZIPs are not downloaded during a normal
+plan.
 
 ## Running the planner
 
@@ -118,7 +120,11 @@ Without `--execute`, the command performs validation and one `rclone` dry-run
 per candidate. Real deletion requires all of `--execute`,
 `--approval-id`, `--plan-run-id`, and `--plan-artifact-id`, plus the expected
 plan digest. Delete reasons are allow-listed and per-run object/byte limits
-are enforced before the first remote call.
+are enforced before the first remote call. Before the first deletion (including
+a dry-run), all candidates that would remove an archived stable installer are
+downloaded from both GitHub Releases and Drive and checked against the manifest
+SHA-256; release-state candidates receive the equivalent Drive byte check. The
+20-object/5-GiB guard bounds this deep verification as well as deletion.
 
 The reusable `.github/workflows/reusable-retention-apply.yml` places the job
 behind the `release-retention-production` protected environment, serializes

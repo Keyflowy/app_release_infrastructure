@@ -25,6 +25,7 @@ from plan import (
   require_key,
   sha256_file,
 )
+from verify_evidence import verify_archive_bytes, verify_metadata_bytes
 
 
 UTC = timezone.utc
@@ -298,6 +299,11 @@ def apply_plan(
   plan_run_id: str,
   plan_artifact_id: str,
   started_at: datetime,
+  manifest_path: Optional[Path] = None,
+  repository: Path = Path("."),
+  github_repository: str = "",
+  drive_remote: str = "gd_admin:",
+  gh: str = "gh",
 ) -> Tuple[int, Dict[str, Any]]:
   statuses: List[Dict[str, Any]] = []
   result: Dict[str, Any] = {
@@ -340,6 +346,48 @@ def apply_plan(
     result["status"] = "failed"
     result["error"] = str(error)
     return 1, result
+
+  if manifest_path is not None and delete:
+    try:
+      manifest = load_json(manifest_path)
+      releases = {
+        item.get("full_zip_object_key"): item
+        for item in manifest.get("releases", [])
+        if isinstance(item, dict)
+      }
+      metadata = {
+        item.get("object_key"): item
+        for item in manifest.get("retention_metadata", [])
+        if isinstance(item, dict)
+      }
+      delete_reasons = {
+        entry.get("key"): entry.get("reason")
+        for entry in plan.get("delete", [])
+        if isinstance(entry, dict)
+      }
+      for key in sorted(delete):
+        reason = delete_reasons.get(key)
+        if reason == "archived-stable-expired":
+          release = releases.get(key)
+          if release is None:
+            raise ApplyError("missing manifest release for archive candidate: {}".format(key))
+          verify_archive_bytes(
+            release,
+            repository,
+            github_repository,
+            drive_remote,
+            rclone_bin,
+            gh,
+          )
+        elif reason == "expired-release-metadata":
+          metadata_entry = metadata.get(key)
+          if metadata_entry is None:
+            raise ApplyError("missing manifest metadata for candidate: {}".format(key))
+          verify_metadata_bytes(metadata_entry, repository, drive_remote, rclone_bin)
+    except (ApplyError, OSError, ValueError) as error:
+      result["status"] = "failed"
+      result["error"] = "deep archive verification failed: {}".format(error)
+      return 1, result
 
   for key in sorted(delete):
     command = ["--dry-run", "deletefile", target_path(remote, key)]
@@ -414,6 +462,9 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
   parser.add_argument("--now")
   parser.add_argument("--result-output", type=Path, default=Path("apply-result.json"))
   parser.add_argument("--execute", action="store_true")
+  parser.add_argument("--github-repository", default="")
+  parser.add_argument("--drive-remote", default="gd_admin:")
+  parser.add_argument("--gh", default="gh")
   return parser.parse_args(argv)
 
 
@@ -453,6 +504,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
       args.plan_run_id,
       args.plan_artifact_id,
       started_at,
+      args.manifest,
+      Path("."),
+      args.github_repository,
+      args.drive_remote,
+      args.gh,
     )
     write_result(args.result_output, result)
     return code

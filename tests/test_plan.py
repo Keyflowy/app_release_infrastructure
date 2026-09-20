@@ -53,12 +53,14 @@ def archived_release(version, release_date, object_key=None, size_bytes=10):
     "github_asset_id": 202,
     "github_asset_name": Path(item["full_zip_object_key"]).name,
     "github_asset_sha256": item["checksum"],
+    "github_asset_digest": item["checksum"],
     "github_asset_size_bytes": size_bytes,
     "drive_object_key": "keyflowy/apps/kindow/releases/v{}/{}".format(
       version,
       Path(item["full_zip_object_key"]).name,
     ),
     "drive_sha256": item["checksum"],
+    "drive_md5": "b" * 32,
     "drive_size_bytes": size_bytes,
     "verified": True,
   }
@@ -119,9 +121,11 @@ class ReleaseRetentionPlanTests(unittest.TestCase):
         "github_asset_id": archive["github_asset_id"],
         "github_asset_name": archive["github_asset_name"],
         "github_asset_sha256": release_item["checksum"],
+        "github_asset_digest": release_item["checksum"],
         "github_asset_size_bytes": release_item["size_bytes"],
         "drive_object_key": archive["drive_object_key"],
         "drive_sha256": release_item["checksum"],
+        "drive_md5": release_item["archive"].get("drive_md5", "b" * 32),
         "drive_size_bytes": release_item["size_bytes"],
         "verified": True,
       })
