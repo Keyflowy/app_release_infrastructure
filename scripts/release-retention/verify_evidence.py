@@ -5,6 +5,7 @@ import argparse
 import hashlib
 import json
 import os
+import posixpath
 import re
 import subprocess
 import sys
@@ -70,6 +71,55 @@ def rclone_cat(rclone, object_path):
   raise AssertionError("unreachable")
 
 
+def metadata_from_entry(entry):
+  if not isinstance(entry, dict):
+    raise ValueError("Drive metadata entry is not an object")
+  size = entry.get("Size")
+  hashes = entry.get("Hashes", {})
+  md5 = hashes.get("md5", hashes.get("MD5")) if isinstance(hashes, dict) else None
+  if not isinstance(size, int) or size < 0:
+    raise ValueError("Drive metadata has an invalid size")
+  if not isinstance(md5, str) or MD5_RE.fullmatch(md5.lower()) is None:
+    raise ValueError("Drive metadata is missing an MD5 checksum")
+  return {"size_bytes": size, "md5": md5.lower()}
+
+
+def rclone_metadata_index(rclone, drive_remote, object_keys):
+  if not object_keys:
+    return {}
+  directory = posixpath.commonpath(object_keys).rsplit("/", 1)[0] + "/"
+  payload = run_bytes([
+    rclone,
+    *RCLONE_TIMEOUT_FLAGS,
+    "lsjson",
+    "--recursive",
+    "--files-only",
+    "--hash",
+    "--no-mimetype",
+    remote_object(drive_remote, directory),
+  ])
+  try:
+    entries = json.loads(payload)
+  except json.JSONDecodeError as error:
+    raise ValueError("Drive metadata response is not JSON") from error
+  if not isinstance(entries, list):
+    raise ValueError("Drive metadata response is not an array")
+  index = {}
+  for entry in entries:
+    if not isinstance(entry, dict):
+      raise ValueError("Drive metadata entry is not an object")
+    relative = entry.get("Path")
+    if not isinstance(relative, str) or not relative:
+      raise ValueError("Drive metadata entry has no path")
+    key = relative if relative in object_keys else directory + relative
+    if key in object_keys:
+      index[key] = metadata_from_entry(entry)
+  missing = sorted(set(object_keys).difference(index))
+  if missing:
+    raise ValueError("Drive metadata did not identify object {}".format(missing[0]))
+  return index
+
+
 def rclone_metadata(rclone, object_path):
   payload = run_bytes([
     rclone,
@@ -86,15 +136,7 @@ def rclone_metadata(rclone, object_path):
     raise ValueError("Drive metadata response is not JSON") from error
   if not isinstance(entries, list) or len(entries) != 1 or not isinstance(entries[0], dict):
     raise ValueError("Drive metadata did not identify exactly one object")
-  entry = entries[0]
-  size = entry.get("Size")
-  hashes = entry.get("Hashes", {})
-  md5 = hashes.get("md5", hashes.get("MD5")) if isinstance(hashes, dict) else None
-  if not isinstance(size, int) or size < 0:
-    raise ValueError("Drive metadata has an invalid size")
-  if not isinstance(md5, str) or MD5_RE.fullmatch(md5.lower()) is None:
-    raise ValueError("Drive metadata is missing an MD5 checksum")
-  return {"size_bytes": size, "md5": md5.lower()}
+  return metadata_from_entry(entries[0])
 
 
 def github_asset_metadata(release, repository, github_repository, gh):
@@ -133,7 +175,7 @@ def github_asset_metadata(release, repository, github_repository, gh):
   return {"digest": digest, "size_bytes": size}
 
 
-def verify_archive(release, repository, github_repository, drive_remote, rclone, gh):
+def verify_archive(release, repository, github_repository, drive_remote, rclone, gh, drive_index=None):
   version = release.get("version")
   label = "releases[{}]".format(version or "?")
   archive = release.get("archive")
@@ -159,7 +201,11 @@ def verify_archive(release, repository, github_repository, drive_remote, rclone,
     raise ValueError("{} has an invalid Drive object key".format(label))
   expected_name = Path(release.get("full_zip_object_key", "")).name
   github = github_asset_metadata(release, repository, github_repository, gh)
-  drive = rclone_metadata(rclone, remote_object(drive_remote, drive_key))
+  drive = (
+    drive_index[drive_key]
+    if drive_index is not None
+    else rclone_metadata(rclone, remote_object(drive_remote, drive_key))
+  )
   expected_digest = archive.get("github_asset_digest", archive.get("github_asset_sha256"))
   expected_md5 = archive.get("drive_md5")
   if not isinstance(expected_digest, str) or SHA256_RE.fullmatch(expected_digest) is None:
@@ -275,6 +321,17 @@ def verify(
     raise ValueError("retention_metadata must be an array")
   tombstones = {}
   verified_drive_objects = set()
+  drive_keys = [
+    metadata.get("backup", metadata.get("drive_backup", {})).get("drive_object_key")
+    for metadata in metadata_entries
+    if isinstance(metadata, dict)
+  ]
+  drive_keys.extend(
+    release.get("archive", {}).get("drive_object_key")
+    for release in manifest.get("releases", [])
+    if isinstance(release, dict) and isinstance(release.get("archive"), dict)
+  )
+  drive_index = rclone_metadata_index(rclone, drive_remote, [key for key in drive_keys if isinstance(key, str)])
   for index, metadata in enumerate(metadata_entries):
     label = "retention_metadata[{}]".format(index)
     if not isinstance(metadata, dict):
@@ -306,7 +363,9 @@ def verify(
       raise ValueError("{} Drive evidence is missing an MD5 checksum".format(label))
     drive_identity = (drive_object_key, drive_md5.lower(), size_bytes)
     if drive_identity not in verified_drive_objects:
-      actual = rclone_metadata(rclone, remote_object(drive_remote, drive_object_key))
+      actual = drive_index.get(drive_object_key)
+      if actual is None:
+        raise ValueError("{} Drive metadata object is missing".format(label))
       if actual["size_bytes"] != size_bytes or actual["md5"] != drive_md5.lower():
         raise ValueError("{} Drive metadata checksum or size differs".format(label))
       verified_drive_objects.add(drive_identity)
@@ -338,6 +397,7 @@ def verify(
       drive_remote,
       rclone,
       gh,
+      drive_index,
     )
     key = evidence["full_zip_object_key"]
     if key in seen_archive_keys:
