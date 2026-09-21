@@ -62,6 +62,7 @@ RELEASE_FIELDS = frozenset({
   "signature_object_key",
   "sparkle_delta_object_keys",
   "archive",
+  "completion",
 })
 REQUIRED_RELEASE_FIELDS = frozenset({
   "version",
@@ -120,8 +121,12 @@ BACKUP_FIELDS = frozenset({
   "verified",
 })
 COMPLETION_FIELDS = frozenset({
+  "evidence_version",
   "git_path",
   "git_commit",
+  "zip_sha256",
+  "manifest_path",
+  "manifest_entry_sha256",
   "path",
   "commit",
   "verified",
@@ -152,6 +157,7 @@ class InventoryObject:
   mod_time: Optional[str] = None
   hashes: Tuple[Tuple[str, str], ...] = ()
   object_id: Optional[str] = None
+  metadata: Tuple[Tuple[str, str], ...] = ()
 
   def as_dict(self) -> Dict[str, Any]:
     value: Dict[str, Any] = {"key": self.key}
@@ -163,6 +169,8 @@ class InventoryObject:
       value["hashes"] = dict(self.hashes)
     if self.object_id is not None:
       value["object_id"] = self.object_id
+    if self.metadata:
+      value["metadata"] = dict(self.metadata)
     return value
 
 
@@ -493,11 +501,36 @@ def validate_metadata_completion(value: Any, label: str) -> Dict[str, Any]:
     raise ValueError("{}.git_commit must be a full Git commit SHA".format(label))
   if not isinstance(value.get("verified"), bool):
     raise ValueError("{}.verified must be boolean".format(label))
-  return {
+  evidence_version = value.get("evidence_version", 1)
+  if type(evidence_version) is not int or evidence_version not in (1, 2):
+    raise ValueError("{}.evidence_version must be 1 or 2".format(label))
+  binding_fields = {"zip_sha256", "manifest_path", "manifest_entry_sha256"}
+  present_bindings = binding_fields.intersection(value)
+  if evidence_version == 1 and present_bindings:
+    raise ValueError("{} legacy evidence cannot contain v2 bindings".format(label))
+  if evidence_version == 2 and present_bindings != binding_fields:
+    raise ValueError("{} v2 evidence must contain all archive and manifest bindings".format(label))
+  if evidence_version == 2 and (
+    "git_path" not in value
+    or "git_commit" not in value
+    or "path" in value
+    or "commit" in value
+  ):
+    raise ValueError("{} v2 evidence must use git_path and git_commit".format(label))
+  result = {
+    "evidence_version": evidence_version,
     "git_path": path,
     "git_commit": commit.lower(),
     "verified": value["verified"],
   }
+  if evidence_version == 2:
+    result["zip_sha256"] = require_sha256(value["zip_sha256"], label + ".zip_sha256")
+    result["manifest_path"] = require_key(value["manifest_path"], label + ".manifest_path")
+    result["manifest_entry_sha256"] = require_sha256(
+      value["manifest_entry_sha256"],
+      label + ".manifest_entry_sha256",
+    )
+  return result
 
 
 def validate_retention_metadata(value: Any, label: str) -> Dict[str, Any]:
@@ -525,6 +558,23 @@ def validate_retention_metadata(value: Any, label: str) -> Dict[str, Any]:
     "backup": backup,
     "completion": completion,
   }
+
+
+def validate_release_completion(release: Dict[str, Any], label: str) -> Dict[str, Any]:
+  completion = validate_metadata_completion(release.get("completion"), label + ".completion")
+  if completion["evidence_version"] != 2:
+    raise ValueError("{}.completion must use evidence_version 2".format(label))
+  if completion["verified"] is not True:
+    raise ValueError("{}.completion.verified must be true".format(label))
+  checksum = require_sha256(release.get("checksum"), label + ".checksum")
+  if completion["zip_sha256"] != checksum:
+    raise ValueError("{}.completion.zip_sha256 must match the release checksum".format(label))
+  identity = dict(release)
+  identity.pop("completion", None)
+  expected_identity = "sha256:" + canonical_sha256(identity)
+  if completion["manifest_entry_sha256"] != expected_identity:
+    raise ValueError("{}.completion.manifest_entry_sha256 must match the release identity".format(label))
+  return completion
 
 
 def archive_is_verified(
@@ -673,6 +723,7 @@ def parse_inventory_value(raw: Any) -> List[InventoryObject]:
       mod_time = None
       hashes: Tuple[Tuple[str, str], ...] = ()
       object_id = None
+      metadata: Tuple[Tuple[str, str], ...] = ()
     elif isinstance(item, dict):
       if item.get("IsDir") is True:
         raise ValueError("inventory object {} must describe a file".format(index))
@@ -702,6 +753,19 @@ def parse_inventory_value(raw: Any) -> List[InventoryObject]:
         item.get("object_id", item.get("ID")),
         "inventory object {} ID".format(index),
       )
+      raw_metadata = item.get("metadata", item.get("Metadata", {}))
+      if raw_metadata is None:
+        raw_metadata = {}
+      if not isinstance(raw_metadata, dict):
+        raise ValueError("inventory object {} metadata must be an object".format(index))
+      normalized_metadata = []
+      for metadata_name, metadata_value in raw_metadata.items():
+        if not isinstance(metadata_name, str) or not metadata_name:
+          raise ValueError("inventory object {} metadata name must be a string".format(index))
+        if not isinstance(metadata_value, str):
+          raise ValueError("inventory object {} metadata value must be a string".format(index))
+        normalized_metadata.append((metadata_name, metadata_value))
+      metadata = tuple(sorted(normalized_metadata))
     else:
       raise ValueError("inventory object {} must be a string or object".format(index))
 
@@ -714,6 +778,7 @@ def parse_inventory_value(raw: Any) -> List[InventoryObject]:
       mod_time=mod_time,
       hashes=hashes,
       object_id=object_id,
+      metadata=metadata,
     )
   return [objects[key] for key in sorted(objects)]
 
@@ -884,9 +949,12 @@ def load_manifest(path: Path) -> Tuple[Dict[str, List[Artifact]], str]:
   raw_retention_metadata = manifest.get("retention_metadata", [])
   if not isinstance(raw_retention_metadata, list):
     raise ValueError("retention_metadata must be an array")
+  v2_metadata_completions = []
   for index, raw_metadata in enumerate(raw_retention_metadata):
     label = "retention_metadata[{}]".format(index)
     metadata = validate_retention_metadata(raw_metadata, label)
+    if metadata["completion"]["evidence_version"] == 2:
+      v2_metadata_completions.append(metadata["completion"])
     add_artifact(
       artifacts,
       metadata["object_key"],
@@ -902,14 +970,23 @@ def load_manifest(path: Path) -> Tuple[Dict[str, List[Artifact]], str]:
       ),
     )
 
+  release_completions = []
   for index, release in enumerate(releases):
     label = "releases[{}]".format(index)
     if not isinstance(release, dict):
       raise ValueError("{} must be an object".format(label))
     reject_unknown_fields(release, RELEASE_FIELDS, label)
     require_fields(release, REQUIRED_RELEASE_FIELDS, label)
+    completion = None
+    if "completion" in release:
+      completion = validate_release_completion(release, label)
+      release_completions.append(completion)
     version_parts = parse_semver(release["version"], label + ".version")
     version = version_parts[:3]
+    if completion is not None and not completion["git_path"].endswith(
+      "/v{}.json".format(release["version"])
+    ):
+      raise ValueError("{}.completion.git_path must match the release version".format(label))
     feature_line = release.get("feature_line")
     expected_feature_line = "{}.{}".format(version[0], version[1])
     if feature_line != expected_feature_line:
@@ -980,6 +1057,9 @@ def load_manifest(path: Path) -> Tuple[Dict[str, List[Artifact]], str]:
         feature_line=feature_line,
       )
     require_unique(normalized_delta_keys, label + ".sparkle_delta_object_keys")
+  for completion in v2_metadata_completions:
+    if completion not in release_completions:
+      raise ValueError("retention metadata v2 completion has no matching release completion")
   return artifacts, product
 
 
@@ -1093,6 +1173,8 @@ def inventory_entry(item: InventoryObject, kind: str, reason: str) -> Dict[str, 
     entry["hashes"] = dict(item.hashes)
   if item.object_id is not None:
     entry["object_id"] = item.object_id
+  if item.metadata:
+    entry["metadata"] = dict(item.metadata)
   return entry
 
 

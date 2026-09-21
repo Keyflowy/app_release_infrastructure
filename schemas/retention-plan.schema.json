@@ -122,7 +122,8 @@
         "size_bytes": { "type": "integer", "minimum": 0 },
         "mod_time": { "type": "string", "minLength": 1 },
         "hashes": { "type": "object", "additionalProperties": { "type": "string", "minLength": 1 } },
-        "object_id": { "type": "string", "minLength": 1 }
+        "object_id": { "type": "string", "minLength": 1 },
+        "metadata": { "type": "object", "additionalProperties": { "type": "string" } }
       }
     }
   }

@@ -23,8 +23,23 @@ class RetentionEvidenceTests(unittest.TestCase):
     contents = b'{"release_id":"v1.2.3"}\n'
     checksum = "sha256:" + VERIFY.hashlib.sha256(contents).hexdigest()
     md5 = VERIFY.hashlib.md5(contents).hexdigest()
-    manifest = directory / "release-manifest.json"
-    manifest.write_text(json.dumps({
+    release = {
+      "version": "1.2.3",
+      "checksum": "sha256:" + "b" * 64,
+    }
+    manifest_entry_sha256 = VERIFY.manifest_entry_sha256(release)
+    completion = {
+      "evidence_version": 2,
+      "git_path": "release-completions/v1.2.3.json",
+      "git_commit": "a" * 40,
+      "zip_sha256": release["checksum"],
+      "manifest_path": "release-manifest.json",
+      "manifest_entry_sha256": manifest_entry_sha256,
+      "verified": True,
+    }
+    release["completion"] = completion
+    manifest_value = {
+      "releases": [release],
       "retention_metadata": [{
         "object_key": "kindow/release-state/v1.2.3/complete.json",
         "checksum": checksum,
@@ -36,15 +51,23 @@ class RetentionEvidenceTests(unittest.TestCase):
           "size_bytes": len(contents),
           "verified": True,
         },
-        "completion": {
-          "git_path": "release-completions/v1.2.3.json",
-          "git_commit": "a" * 40,
-          "verified": True,
-        },
+        "completion": completion,
       }],
-    }), encoding="utf-8")
-    tombstone = b'{"release_id":"v1.2.3","version":"1.2.3"}\n'
-    return manifest, contents, tombstone
+    }
+    manifest = directory / "release-manifest.json"
+    manifest.write_text(json.dumps(manifest_value), encoding="utf-8")
+    tombstone = json.dumps({
+      "release_id": "v1.2.3",
+      "version": "1.2.3",
+      "evidence_version": 2,
+      "zip_sha256": release["checksum"],
+      "manifest_path": "release-manifest.json",
+      "manifest_entry_sha256": manifest_entry_sha256,
+    }).encode()
+    historical_release = dict(release)
+    historical_release.pop("completion")
+    historical_manifest = json.dumps({"releases": [historical_release]}).encode()
+    return manifest, contents, tombstone, historical_manifest
 
   def archive_fixture(self):
     temporary = tempfile.TemporaryDirectory()
@@ -81,19 +104,24 @@ class RetentionEvidenceTests(unittest.TestCase):
     return json.dumps([{"id": 202, "name": "kindow-1.2.3.zip"}]).encode()
 
   def test_verified_drive_bytes_and_reachable_git_tombstone_are_accepted(self):
-    manifest, contents, tombstone = self.fixture()
+    manifest, contents, tombstone, historical_manifest = self.fixture()
 
     drive_metadata = json.dumps([{"Path": "complete.json", "Size": len(contents), "Hashes": {"md5": VERIFY.hashlib.md5(contents).hexdigest()}}]).encode()
-    with patch.object(VERIFY, "run_bytes", side_effect=[drive_metadata, tombstone]) as run:
+    with patch.object(
+      VERIFY,
+      "run_bytes",
+      side_effect=[drive_metadata, b"", tombstone, historical_manifest],
+    ) as run:
       VERIFY.verify(manifest, Path("."), "gd_admin:", "rclone")
 
-    self.assertEqual(run.call_count, 2)
+    self.assertEqual(run.call_count, 4)
     self.assertEqual(run.call_args_list[0].args[0][0], "rclone")
     self.assertIn("lsjson", run.call_args_list[0].args[0])
-    self.assertEqual(run.call_args_list[1].args[0][0:3], ["git", "-C", "."])
+    self.assertIn("merge-base", run.call_args_list[1].args[0])
+    self.assertEqual(run.call_args_list[2].args[0][0:3], ["git", "-C", "."])
 
   def test_drive_checksum_mismatch_fails_closed_before_git_is_consulted(self):
-    manifest, contents, tombstone = self.fixture()
+    manifest, contents, tombstone, _ = self.fixture()
 
     drive_metadata = json.dumps([{"Path": "complete.json", "Size": len(contents), "Hashes": {"md5": "0" * 32}}]).encode()
     with patch.object(VERIFY, "run_bytes", side_effect=[drive_metadata, tombstone]) as run:
@@ -115,13 +143,89 @@ class RetentionEvidenceTests(unittest.TestCase):
     sleep.assert_called_once_with(5)
 
   def test_git_tombstone_must_bind_the_same_release(self):
-    manifest, contents, _ = self.fixture()
-    wrong_tombstone = b'{"release_id":"v9.9.9","version":"9.9.9"}\n'
+    manifest, contents, tombstone, historical_manifest = self.fixture()
+    wrong_tombstone = json.loads(tombstone)
+    wrong_tombstone["release_id"] = "v9.9.9"
 
     drive_metadata = json.dumps([{"Path": "complete.json", "Size": len(contents), "Hashes": {"md5": VERIFY.hashlib.md5(contents).hexdigest()}}]).encode()
-    with patch.object(VERIFY, "run_bytes", side_effect=[drive_metadata, wrong_tombstone]):
+    with patch.object(
+      VERIFY,
+      "run_bytes",
+      side_effect=[drive_metadata, b"", json.dumps(wrong_tombstone).encode(), historical_manifest],
+    ):
       with self.assertRaisesRegex(ValueError, "tombstone identity differs"):
         VERIFY.verify(manifest, Path("."), "gd_admin:", "rclone")
+
+  def test_given_a_completion_commit_outside_trusted_main_then_evidence_fails_closed(self):
+    manifest, contents, _, _ = self.fixture()
+    drive_metadata = json.dumps([{"Path": "complete.json", "Size": len(contents), "Hashes": {"md5": VERIFY.hashlib.md5(contents).hexdigest()}}]).encode()
+    with patch.object(
+      VERIFY,
+      "run_bytes",
+      side_effect=[drive_metadata, ValueError("not an ancestor")],
+    ) as run:
+      with self.assertRaisesRegex(ValueError, "not reachable from trusted main"):
+        VERIFY.verify(manifest, Path("."), "gd_admin:", "rclone")
+
+    self.assertEqual(run.call_count, 2)
+
+  def test_given_a_tombstone_for_different_zip_bytes_then_evidence_fails_closed(self):
+    manifest, contents, tombstone, historical_manifest = self.fixture()
+    wrong_tombstone = json.loads(tombstone)
+    wrong_tombstone["zip_sha256"] = "sha256:" + "f" * 64
+    drive_metadata = json.dumps([{"Path": "complete.json", "Size": len(contents), "Hashes": {"md5": VERIFY.hashlib.md5(contents).hexdigest()}}]).encode()
+    with patch.object(
+      VERIFY,
+      "run_bytes",
+      side_effect=[drive_metadata, b"", json.dumps(wrong_tombstone).encode(), historical_manifest],
+    ):
+      with self.assertRaisesRegex(ValueError, "tombstone ZIP digest differs"):
+        VERIFY.verify(manifest, Path("."), "gd_admin:", "rclone")
+
+  def test_given_the_completion_commit_has_a_different_manifest_entry_then_evidence_fails_closed(self):
+    manifest, contents, tombstone, _ = self.fixture()
+    historical_manifest = json.dumps({
+      "releases": [{"version": "1.2.3", "checksum": "sha256:" + "c" * 64}],
+    }).encode()
+    drive_metadata = json.dumps([{"Path": "complete.json", "Size": len(contents), "Hashes": {"md5": VERIFY.hashlib.md5(contents).hexdigest()}}]).encode()
+    with patch.object(
+      VERIFY,
+      "run_bytes",
+      side_effect=[drive_metadata, b"", tombstone, historical_manifest],
+    ):
+      with self.assertRaisesRegex(ValueError, "manifest entry differs"):
+        VERIFY.verify(manifest, Path("."), "gd_admin:", "rclone")
+
+  def test_manifest_identity_excludes_the_self_referential_completion_field(self):
+    release = {"version": "1.2.3", "checksum": "sha256:" + "a" * 64}
+    completed_release = {
+      **release,
+      "completion": {"manifest_entry_sha256": VERIFY.manifest_entry_sha256(release)},
+    }
+
+    self.assertEqual(
+      VERIFY.manifest_entry_sha256(release),
+      VERIFY.manifest_entry_sha256(completed_release),
+    )
+
+  def test_legacy_evidence_is_accepted_only_after_deriving_the_same_strong_bindings(self):
+    manifest, contents, tombstone, historical_manifest = self.fixture()
+    manifest_value = json.loads(manifest.read_text(encoding="utf-8"))
+    completion = manifest_value["retention_metadata"][0]["completion"]
+    for field in ("evidence_version", "zip_sha256", "manifest_path", "manifest_entry_sha256"):
+      completion.pop(field)
+    manifest_value["releases"][0].pop("completion")
+    manifest.write_text(json.dumps(manifest_value), encoding="utf-8")
+    tombstone_value = json.loads(tombstone)
+    tombstone_value.pop("manifest_entry_sha256")
+    tombstone_value["zip_sha256"] = tombstone_value["zip_sha256"].removeprefix("sha256:")
+    drive_metadata = json.dumps([{"Path": "complete.json", "Size": len(contents), "Hashes": {"md5": VERIFY.hashlib.md5(contents).hexdigest()}}]).encode()
+    with patch.object(
+      VERIFY,
+      "run_bytes",
+      side_effect=[drive_metadata, b"", json.dumps(tombstone_value).encode(), historical_manifest],
+    ):
+      VERIFY.verify(manifest, manifest.parent, "gd_admin:", "rclone")
 
   def test_verified_github_asset_and_drive_bytes_are_returned_as_archive_evidence(self):
     manifest, contents = self.archive_fixture()

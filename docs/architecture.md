@@ -38,16 +38,34 @@ present in a reviewed plan whose reason is an approved expiry rule. A plan is
 bound to a canonical SHA-256 `plan_id`, manifest/policy/inventory digests,
 expiry time, remote root, and product prefix. Before deletion, the apply
 command obtains a fresh `rclone lsjson --recursive --files-only --hash`
-inventory. The inventory can cover a shared remote root, but the plan digest
-and drift checks are scoped to the product prefix. New objects, missing keep
-objects, or changed size/modtime/hash/ID fingerprints inside that prefix fail
+inventory. It refreshes that inventory again immediately before each real
+delete and requires the planned size/modtime/hash/provider-ID/metadata
+fingerprint to remain unchanged. New plans collect provider metadata with
+`lsjson --metadata`; immutable older plans compare the fields they originally
+bound. Because rclone `deletefile` exposes no ETag/If-Match condition, this
+immediate revalidation is the strongest delete boundary exposed by the
+configured provider. The inventory can cover a shared remote root,
+but the plan digest and drift checks are scoped to the product prefix. New
+objects, missing keep objects, or changed fingerprints inside that prefix fail
 closed. Objects in sibling product prefixes are ignored. A missing delete
 candidate is the only tolerated drift and is recorded as `already-absent`.
 
 Protected metadata, live appcast references, unarchived stable installers, and
 unknown objects are never deletion candidates. Under policy v2, release-state
 metadata is eligible only after the plan workflow verifies its Drive MD5/size
-metadata and Git completion tombstone. Archive-backed installers use GitHub
+metadata and Git completion tombstone. Completion verification requires the
+declared commit to be reachable from `refs/remotes/origin/main`, loads the
+tombstone and manifest from that exact commit, and binds both to the current
+release entry and archive ZIP SHA-256. New callers emit completion evidence v2
+with explicit `zip_sha256`, `manifest_path`, and canonical
+`manifest_entry_sha256` fields. The same v2 completion object appears on the
+release entry and every associated release-state metadata entry; its Git
+tombstone repeats the version, manifest path, and both digests. The canonical
+entry identity excludes the release object's top-level `completion` field so
+recording the identity there does not become self-referential. Legacy entries
+without a version remain readable, but must satisfy the same derived
+trusted-history and digest checks.
+Archive-backed installers use GitHub
 asset `digest`, Drive MD5/size, and the manifest as the normal plan evidence;
 the plan does not download historical ZIPs. Immediately before any deletion,
 apply deeply hashes every candidate archive copy (GitHub and Drive) and every

@@ -792,6 +792,85 @@ class ReleaseRetentionPlanTests(unittest.TestCase):
       ("keep", "unverified-release-metadata"),
     )
 
+  def test_completion_evidence_v2_requires_complete_archive_and_manifest_bindings(self):
+    completion = {
+      "evidence_version": 2,
+      "git_path": "release-completions/v3.1.0.json",
+      "git_commit": "d" * 40,
+      "zip_sha256": "sha256:" + "a" * 64,
+      "manifest_path": "release-manifest.json",
+      "manifest_entry_sha256": "sha256:" + "b" * 64,
+      "verified": True,
+    }
+
+    normalized = plan.validate_metadata_completion(completion, "completion")
+    self.assertEqual(normalized, completion)
+
+    for field in ("zip_sha256", "manifest_path", "manifest_entry_sha256"):
+      with self.subTest(field=field):
+        incomplete = dict(completion)
+        incomplete.pop(field)
+        with self.assertRaisesRegex(ValueError, "must contain all"):
+          plan.validate_metadata_completion(incomplete, "completion")
+
+  def test_legacy_completion_evidence_rejects_partial_v2_bindings(self):
+    completion = {
+      "git_path": "release-completions/v3.1.0.json",
+      "git_commit": "d" * 40,
+      "zip_sha256": "sha256:" + "a" * 64,
+      "verified": True,
+    }
+
+    with self.assertRaisesRegex(ValueError, "legacy evidence"):
+      plan.validate_metadata_completion(completion, "completion")
+
+  def test_release_completion_v2_is_bound_to_the_release_identity_without_self_reference(self):
+    entry = release("3.2.7", "2026-08-25")
+    entry["checksum"] = "sha256:" + "a" * 64
+    entry["completion"] = {
+      "evidence_version": 2,
+      "git_path": "release-completions/v3.2.7.json",
+      "git_commit": "d" * 40,
+      "zip_sha256": entry["checksum"],
+      "manifest_path": "release-manifest.json",
+      "manifest_entry_sha256": "sha256:" + plan.canonical_sha256(entry),
+      "verified": True,
+    }
+    manifest = {
+      "schema_version": 1,
+      "product": "kindow",
+      "generated_at": "2026-08-26T00:00:00Z",
+      "releases": [entry],
+    }
+    manifest_path, inventory_path = self.write_fixture(manifest, [entry["full_zip_object_key"]])
+
+    result = plan.build_plan(manifest_path, POLICY, inventory_path, AS_OF)
+
+    self.assertEqual(result["summary"]["delete_count"], 0)
+
+  def test_release_completion_with_a_different_manifest_identity_is_rejected(self):
+    entry = release("3.2.7", "2026-08-25")
+    entry["checksum"] = "sha256:" + "a" * 64
+    entry["completion"] = {
+      "evidence_version": 2,
+      "git_path": "release-completions/v3.2.7.json",
+      "git_commit": "d" * 40,
+      "zip_sha256": entry["checksum"],
+      "manifest_path": "release-manifest.json",
+      "manifest_entry_sha256": "sha256:" + "b" * 64,
+      "verified": True,
+    }
+    manifest = {
+      "schema_version": 1,
+      "product": "kindow",
+      "generated_at": "2026-08-26T00:00:00Z",
+      "releases": [entry],
+    }
+    manifest_path, inventory_path = self.write_fixture(manifest, [entry["full_zip_object_key"]])
+
+    with self.assertRaisesRegex(ValueError, "must match the release identity"):
+      plan.build_plan(manifest_path, POLICY, inventory_path, AS_OF)
+
   def test_parser_field_contract_matches_the_canonical_manifest_schema(self):
     schema = json.loads(
       (ROOT / "schemas" / "release-manifest.schema.json").read_text(encoding="utf-8")
@@ -803,6 +882,10 @@ class ReleaseRetentionPlanTests(unittest.TestCase):
     self.assertEqual(
       plan.REQUIRED_RELEASE_FIELDS,
       frozenset(schema["$defs"]["release"]["required"]),
+    )
+    self.assertEqual(
+      plan.COMPLETION_FIELDS,
+      frozenset(schema["$defs"]["metadataCompletion"]["properties"]),
     )
 
   def test_v2_output_field_contract_matches_the_canonical_plan_schema(self):
