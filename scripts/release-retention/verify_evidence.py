@@ -271,7 +271,176 @@ def verify_archive_bytes(release, repository, github_repository, drive_remote, r
   return {"github_sha256": github_checksum, "drive_sha256": drive_checksum, "size_bytes": expected_size}
 
 
-def verify_metadata_bytes(metadata, repository, drive_remote, rclone):
+def canonical_sha256(value):
+  encoded = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+  return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
+def manifest_entry_sha256(release):
+  identity = dict(release)
+  identity.pop("completion", None)
+  return canonical_sha256(identity)
+
+
+def normalized_sha256(value, label):
+  if isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value):
+    return "sha256:" + value
+  if not isinstance(value, str) or SHA256_RE.fullmatch(value) is None:
+    raise ValueError("{} is not a SHA-256 checksum".format(label))
+  return value
+
+
+def repository_manifest_path(manifest_path, repository):
+  path = Path(manifest_path)
+  if not path.is_absolute():
+    return path.as_posix()
+  try:
+    return path.resolve().relative_to(Path(repository).resolve()).as_posix()
+  except ValueError as error:
+    raise ValueError("manifest path is outside the caller repository") from error
+
+
+def release_entry(manifest, version, label):
+  releases = manifest.get("releases", [])
+  if not isinstance(releases, list):
+    raise ValueError("{} manifest releases is not an array".format(label))
+  matches = [
+    release
+    for release in releases
+    if isinstance(release, dict) and release.get("version") == version
+  ]
+  if len(matches) != 1:
+    raise ValueError("{} manifest does not identify exactly one release".format(label))
+  return matches[0]
+
+
+def verify_completion(
+  metadata,
+  manifest,
+  manifest_path,
+  repository,
+  trusted_main_ref="refs/remotes/origin/main",
+):
+  object_key = metadata.get("object_key", "")
+  match = STATE_KEY_RE.fullmatch(object_key)
+  if match is None:
+    raise ValueError("release metadata object key is not versioned")
+  tag = match.group(1)
+  version = tag.removeprefix("v")
+  completion = selected(metadata, "completion", "git_completion_tombstone", object_key)
+  git_path = completion.get("git_path", completion.get("path"))
+  git_commit = completion.get("git_commit", completion.get("commit"))
+  if not isinstance(git_path, str) or not git_path.endswith("/{}.json".format(tag)):
+    raise ValueError("release completion path does not match release tag")
+  if not isinstance(git_commit, str) or re.fullmatch(r"[0-9a-fA-F]{40,64}", git_commit) is None:
+    raise ValueError("release completion commit is invalid")
+
+  evidence_version = completion.get("evidence_version", 1)
+  if type(evidence_version) is not int or evidence_version not in (1, 2):
+    raise ValueError("release completion evidence_version must be 1 or 2")
+  binding_fields = {"zip_sha256", "manifest_path", "manifest_entry_sha256"}
+  present_bindings = binding_fields.intersection(completion)
+  if evidence_version == 1 and present_bindings:
+    raise ValueError("legacy release completion cannot contain v2 bindings")
+  if evidence_version == 2 and present_bindings != binding_fields:
+    raise ValueError("release completion v2 bindings are incomplete")
+  if evidence_version == 2 and (
+    "git_path" not in completion
+    or "git_commit" not in completion
+    or "path" in completion
+    or "commit" in completion
+  ):
+    raise ValueError("release completion v2 must use git_path and git_commit")
+  bound_manifest_path = completion.get("manifest_path")
+  if bound_manifest_path is None:
+    bound_manifest_path = repository_manifest_path(manifest_path, repository)
+  if (
+    not isinstance(bound_manifest_path, str)
+    or not bound_manifest_path
+    or bound_manifest_path.startswith("/")
+    or "\\" in bound_manifest_path
+    or any(part in ("", ".", "..") for part in bound_manifest_path.split("/"))
+  ):
+    raise ValueError("release completion manifest path is invalid")
+
+  current_release = release_entry(manifest, version, "current")
+  current_archive_sha256 = normalized_sha256(
+    current_release.get("checksum"),
+    "current release archive checksum",
+  )
+  current_manifest_entry_sha256 = manifest_entry_sha256(current_release)
+  if evidence_version == 2:
+    if completion.get("zip_sha256") != current_archive_sha256:
+      raise ValueError("release completion ZIP digest differs from the manifest")
+    if completion.get("manifest_entry_sha256") != current_manifest_entry_sha256:
+      raise ValueError("release completion manifest identity differs")
+    if current_release.get("completion") != completion:
+      raise ValueError("release completion evidence differs from the release entry")
+
+  try:
+    run_bytes([
+      "git", "-C", str(repository), "merge-base", "--is-ancestor",
+      git_commit, trusted_main_ref,
+    ])
+  except ValueError as error:
+    raise ValueError("release completion commit is not reachable from trusted main") from error
+
+  tombstone_bytes = run_bytes([
+    "git", "-C", str(repository), "show", "{}:{}".format(git_commit, git_path),
+  ])
+  manifest_bytes = run_bytes([
+    "git", "-C", str(repository), "show",
+    "{}:{}".format(git_commit, bound_manifest_path),
+  ])
+  try:
+    tombstone = json.loads(tombstone_bytes)
+  except json.JSONDecodeError as error:
+    raise ValueError("release completion tombstone is not JSON") from error
+  try:
+    historical_manifest = json.loads(manifest_bytes)
+  except json.JSONDecodeError as error:
+    raise ValueError("release completion manifest is not JSON") from error
+  if tombstone.get("release_id") != tag or tombstone.get("version") != version:
+    raise ValueError("release completion tombstone identity differs")
+  tombstone_archive_sha256 = normalized_sha256(
+    tombstone.get("zip_sha256"),
+    "release completion tombstone ZIP digest",
+  )
+  if tombstone_archive_sha256 != current_archive_sha256:
+    raise ValueError("release completion tombstone ZIP digest differs from the manifest")
+  historical_release = release_entry(historical_manifest, version, "completion commit")
+  historical_manifest_entry_sha256 = manifest_entry_sha256(historical_release)
+  if historical_manifest_entry_sha256 != current_manifest_entry_sha256:
+    raise ValueError("release completion manifest entry differs from the current manifest")
+  if evidence_version == 2:
+    if tombstone.get("evidence_version") != 2:
+      raise ValueError("release completion tombstone evidence version differs")
+    if tombstone.get("manifest_path") != bound_manifest_path:
+      raise ValueError("release completion tombstone manifest path differs")
+    if tombstone.get("manifest_entry_sha256") != current_manifest_entry_sha256:
+      raise ValueError("release completion tombstone manifest identity differs")
+    if normalized_sha256(
+      tombstone.get("zip_sha256"),
+      "release completion tombstone ZIP digest",
+    ) != completion["zip_sha256"]:
+      raise ValueError("release completion tombstone ZIP digest differs from evidence")
+  return {
+    "git_commit": git_commit.lower(),
+    "git_path": git_path,
+    "zip_sha256": current_archive_sha256,
+    "manifest_entry_sha256": current_manifest_entry_sha256,
+  }
+
+
+def verify_metadata_bytes(
+  metadata,
+  manifest,
+  manifest_path,
+  repository,
+  drive_remote,
+  rclone,
+  trusted_main_ref="refs/remotes/origin/main",
+):
   """Deeply verify one release-state object immediately before deletion."""
   backup = metadata.get("backup", metadata.get("drive_backup", {}))
   drive_key = backup.get("drive_object_key")
@@ -283,17 +452,13 @@ def verify_metadata_bytes(metadata, repository, drive_remote, rclone):
   actual_checksum = "sha256:" + hashlib.sha256(contents).hexdigest()
   if actual_checksum != expected_checksum or len(contents) != expected_size:
     raise ValueError("Drive release metadata checksum or size differs")
-  completion = metadata.get("completion", metadata.get("git_completion_tombstone", {}))
-  git_path = completion.get("git_path", completion.get("path"))
-  git_commit = completion.get("git_commit", completion.get("commit"))
-  tombstone = run_bytes(["git", "-C", str(repository), "show", "{}:{}".format(git_commit, git_path)])
-  try:
-    value = json.loads(tombstone)
-  except json.JSONDecodeError as error:
-    raise ValueError("release completion tombstone is not JSON") from error
-  tag = Path(metadata["object_key"]).parts[2]
-  if value.get("release_id") != tag or value.get("version") != tag.removeprefix("v"):
-    raise ValueError("release completion tombstone identity differs")
+  verify_completion(
+    metadata,
+    manifest,
+    manifest_path,
+    repository,
+    trusted_main_ref,
+  )
   return {"sha256": actual_checksum, "size_bytes": len(contents)}
 
 
@@ -313,13 +478,14 @@ def verify(
   rclone,
   github_repository=None,
   gh="gh",
+  trusted_main_ref="refs/remotes/origin/main",
 ):
   with Path(manifest_path).open(encoding="utf-8") as source:
     manifest = json.load(source)
   metadata_entries = manifest.get("retention_metadata", [])
   if not isinstance(metadata_entries, list):
     raise ValueError("retention_metadata must be an array")
-  tombstones = {}
+  completions = {}
   verified_drive_objects = set()
   drive_keys = [
     metadata.get("backup", metadata.get("drive_backup", {})).get("drive_object_key")
@@ -375,15 +541,14 @@ def verify(
     if not isinstance(git_path, str) or not git_path.endswith("/{}.json".format(tag)):
       raise ValueError("{} completion path does not match release tag".format(label))
     identity = (git_commit, git_path)
-    if identity not in tombstones:
-      contents = run_bytes(["git", "-C", str(repository), "show", "{}:{}".format(git_commit, git_path)])
-      try:
-        tombstone = json.loads(contents)
-      except json.JSONDecodeError as error:
-        raise ValueError("{} completion tombstone is not JSON".format(label)) from error
-      if tombstone.get("release_id") != tag or tombstone.get("version") != tag.removeprefix("v"):
-        raise ValueError("{} completion tombstone identity differs".format(label))
-      tombstones[identity] = tombstone
+    if identity not in completions:
+      completions[identity] = verify_completion(
+        metadata,
+        manifest,
+        manifest_path,
+        repository,
+        trusted_main_ref,
+      )
 
   archives = []
   seen_archive_keys = set()
@@ -426,6 +591,7 @@ def main():
     help="GitHub owner/name containing the release assets",
   )
   parser.add_argument("--gh", default="gh")
+  parser.add_argument("--trusted-main-ref", default="refs/remotes/origin/main")
   parser.add_argument("--output", type=Path)
   args = parser.parse_args()
   try:
@@ -436,6 +602,7 @@ def main():
       args.rclone,
       args.github_repository,
       args.gh,
+      args.trusted_main_ref,
     )
     if args.output is not None:
       args.output.write_text(

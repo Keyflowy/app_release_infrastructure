@@ -101,17 +101,28 @@ def normalize_fingerprint(value: Dict[str, Any], label: str) -> InventoryObject:
     raise ApplyError("{}.object_id must be a non-empty string".format(label))
   if not hashes and object_id is None:
     raise ApplyError("{}.fingerprint needs hashes or object_id".format(label))
+  raw_metadata = value.get("metadata", {})
+  if not isinstance(raw_metadata, dict):
+    raise ApplyError("{}.metadata must be an object".format(label))
+  metadata: List[Tuple[str, str]] = []
+  for metadata_name, metadata_value in raw_metadata.items():
+    if not isinstance(metadata_name, str) or not metadata_name or not isinstance(metadata_value, str):
+      raise ApplyError("{}.metadata must contain string keys and values".format(label))
+    metadata.append((metadata_name, metadata_value))
   return InventoryObject(
     key=key,
     size_bytes=size_bytes,
     mod_time=mod_time,
     hashes=tuple(sorted(hashes)),
     object_id=object_id,
+    metadata=tuple(sorted(metadata)),
   )
 
 
 def fingerprint_equal(left: InventoryObject, right: InventoryObject) -> bool:
-  return left.as_dict() == right.as_dict()
+  expected = left.as_dict()
+  actual = right.as_dict()
+  return all(actual.get(field) == value for field, value in expected.items())
 
 
 def inventory_from_entries(entries: Sequence[Dict[str, Any]], label: str) -> Dict[str, InventoryObject]:
@@ -242,6 +253,7 @@ def list_inventory(
     "--recursive",
     "--files-only",
     "--hash",
+    "--metadata",
     "--no-mimetype",
     remote,
   ])
@@ -383,7 +395,14 @@ def apply_plan(
           metadata_entry = metadata.get(key)
           if metadata_entry is None:
             raise ApplyError("missing manifest metadata for candidate: {}".format(key))
-          verify_metadata_bytes(metadata_entry, repository, drive_remote, rclone_bin)
+          verify_metadata_bytes(
+            metadata_entry,
+            manifest,
+            manifest_path,
+            repository,
+            drive_remote,
+            rclone_bin,
+          )
     except (ApplyError, OSError, ValueError) as error:
       result["status"] = "failed"
       result["error"] = "deep archive verification failed: {}".format(error)
@@ -403,6 +422,23 @@ def apply_plan(
     return 0, result
 
   for index, key in enumerate(sorted(delete)):
+    try:
+      before_delete = list_inventory(
+        rclone_bin,
+        remote,
+        plan["r2_prefix"],
+        plan.get("excluded_prefixes", []),
+      )
+      compare_inventory(keep, delete, before_delete)
+    except ApplyError as error:
+      statuses[index]["status"] = "verification-failed"
+      statuses[index]["error"] = str(error)
+      result["status"] = "failed"
+      result["error"] = "pre-delete inventory verification failed: {}".format(error)
+      return 1, result
+    if key not in before_delete:
+      statuses[index]["status"] = "already-absent"
+      continue
     command_result = run_command(rclone_bin, ["deletefile", target_path(remote, key)])
     if command_result.returncode == 0:
       statuses[index]["status"] = "deleted"

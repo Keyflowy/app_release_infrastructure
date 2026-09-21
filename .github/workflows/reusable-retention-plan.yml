@@ -130,6 +130,7 @@ jobs:
             --recursive \
             --files-only \
             --hash \
+            --metadata \
             --no-mimetype \
             "$RCLONE_REMOTE" > "$inventory_path"
           echo "path=$inventory_path" >> "$GITHUB_OUTPUT"

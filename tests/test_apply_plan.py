@@ -39,6 +39,7 @@ def inventory_item(version, size, digest):
     "Size": size,
     "ModTime": "2026-08-25T00:00:00Z",
     "Hashes": {"MD5": digest},
+    "Metadata": {"content-type": "application/zip"},
   }
 
 
@@ -257,7 +258,7 @@ class RetentionApplyTests(unittest.TestCase):
     _, retention_plan, plan_path, _ = self.fixture()
     initial = [inventory_item("3.1.0", 10, "old"), inventory_item("3.1.4", 20, "new")]
     final = [inventory_item("3.1.4", 20, "new")]
-    outputs = [self.lsjson(initial), "", "", self.lsjson(final)]
+    outputs = [self.lsjson(initial), "", self.lsjson(initial), "", self.lsjson(final)]
 
     def command(args, **kwargs):
       output = outputs.pop(0)
@@ -277,8 +278,37 @@ class RetentionApplyTests(unittest.TestCase):
         "--execute",
       ])
     self.assertEqual(code, 0)
-    self.assertEqual(run.call_count, 4)
-    self.assertEqual(run.call_args_list[2].args[0][1:3], ["deletefile", REMOTE + "kindow/releases/3.1.0.zip"])
+    self.assertEqual(run.call_count, 5)
+    self.assertEqual(run.call_args_list[3].args[0][1:3], ["deletefile", REMOTE + "kindow/releases/3.1.0.zip"])
+
+  def test_given_a_candidate_changes_after_deep_checks_when_executing_then_no_object_is_deleted(self):
+    _, retention_plan, plan_path, _ = self.fixture()
+    initial = [inventory_item("3.1.0", 10, "old"), inventory_item("3.1.4", 20, "new")]
+    changed_candidate = inventory_item("3.1.0", 10, "old")
+    changed_candidate["Metadata"] = {"content-type": "application/octet-stream"}
+    changed = [changed_candidate, inventory_item("3.1.4", 20, "new")]
+    responses = [
+      CompletedProcess(args=["rclone"], returncode=0, stdout=self.lsjson(initial), stderr=""),
+      CompletedProcess(args=["rclone"], returncode=0, stdout="", stderr=""),
+      CompletedProcess(args=["rclone"], returncode=0, stdout=self.lsjson(changed), stderr=""),
+    ]
+    with patch("apply_plan.subprocess.run", side_effect=responses) as run:
+      code = apply_plan.main([
+        "--plan", str(plan_path),
+        "--expected-plan-sha256", retention_plan["plan_id"],
+        "--product", "kindow",
+        "--rclone-remote", REMOTE,
+        "--r2-prefix", PREFIX,
+        "--approval-id", "approval-123",
+        "--plan-run-id", "run-123",
+        "--plan-artifact-id", "artifact-123",
+        "--now", "2026-08-26T00:00:00Z",
+        "--execute",
+      ])
+
+    self.assertEqual(code, 1)
+    self.assertEqual(run.call_count, 3)
+    self.assertNotIn("deletefile", run.call_args_list[-1].args[0])
 
   def test_expired_plan_is_rejected(self):
     _, retention_plan, plan_path, _ = self.fixture()
@@ -311,14 +341,13 @@ class RetentionApplyTests(unittest.TestCase):
     self.assertEqual(code, 1)
     self.assertEqual(run.call_count, 1)
 
-  def test_already_absent_after_a_failed_delete_is_idempotent(self):
+  def test_given_a_candidate_is_already_absent_at_delete_time_then_apply_is_idempotent(self):
     _, retention_plan, plan_path, _ = self.fixture()
     initial = [inventory_item("3.1.0", 10, "old"), inventory_item("3.1.4", 20, "new")]
     final = [inventory_item("3.1.4", 20, "new")]
     responses = [
       CompletedProcess(args=["rclone"], returncode=0, stdout=self.lsjson(initial), stderr=""),
       CompletedProcess(args=["rclone"], returncode=0, stdout="", stderr=""),
-      CompletedProcess(args=["rclone"], returncode=1, stdout="", stderr="not found"),
       CompletedProcess(args=["rclone"], returncode=0, stdout=self.lsjson(final), stderr=""),
       CompletedProcess(args=["rclone"], returncode=0, stdout=self.lsjson(final), stderr=""),
     ]
@@ -336,7 +365,7 @@ class RetentionApplyTests(unittest.TestCase):
         "--execute",
       ])
     self.assertEqual(code, 0)
-    self.assertEqual(run.call_count, 5)
+    self.assertEqual(run.call_count, 4)
 
   def test_execute_requires_an_explicit_approval_binding(self):
     _, retention_plan, plan_path, _ = self.fixture()

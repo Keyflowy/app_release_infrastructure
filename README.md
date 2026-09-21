@@ -31,7 +31,8 @@ Production products may opt into policy v2 with
   Google Drive MD5/size metadata match the manifest;
 - protects every installer and delta referenced by the live R2 appcast;
 - ages release-state metadata only after its Drive bytes and committed Git
-  completion tombstone have been verified by the reusable workflow;
+  completion tombstone, archive digest, trusted-main ancestry, and manifest
+  identity have been verified by the reusable workflow;
 - excludes fallback-cache prefixes owned by a separate native R2 lifecycle;
 - limits each deterministic deletion batch and defers the remainder to the
   next scheduled plan.
@@ -56,9 +57,11 @@ release tag once the repository's first release is published. Do not use a
 mutable branch for production callers.
 For policy v2 it also snapshots the current R2 appcast, verifies every declared
 archive and Drive backup from remote metadata (GitHub `digest`, Drive MD5 and
-size), and proves each Git completion tombstone exists at the declared commit
-before producing a plan. Historical ZIPs are not downloaded during a normal
-plan.
+size), and proves each Git completion commit is reachable from
+`refs/remotes/origin/main`. It reads both the tombstone and release manifest at
+that commit, then binds their release identity and ZIP digest to the current
+manifest before producing a plan. Historical ZIPs are not downloaded during a
+normal plan.
 
 ## Running the planner
 
@@ -112,9 +115,14 @@ python3 scripts/release-retention/plan.py \
 always refreshes the remote with `rclone lsjson --recursive --files-only
 --hash`, rejects new objects or changed fingerprints within the approved
 product prefix, and preserves every planned keep object. Sibling product
-prefixes are outside the plan and ignored. A missing delete candidate is treated as
-`already-absent`, which makes an interrupted run safe to retry with the same
-plan. Any other delete failure stops immediately.
+prefixes are outside the plan and ignored. Immediately before every real
+`deletefile`, apply refreshes the inventory again and compares the candidate's
+planned size, modification time, hashes, provider object ID, and metadata. New
+plans collect metadata with `lsjson --metadata`; old immutable plans remain
+applicable but compare only the fingerprint fields they originally bound. A missing
+delete candidate is treated as `already-absent`, which makes an interrupted run
+safe to retry with the same plan. Any changed fingerprint or other delete
+failure stops immediately.
 
 Without `--execute`, the command performs validation and one `rclone` dry-run
 per candidate. Real deletion requires all of `--execute`,
@@ -150,6 +158,22 @@ intentional fail-closed behavior: a misspelled safety field such as `fallbak`
 must stop planning instead of being interpreted as `fallback: false`.
 The planner also rejects unknown policy keys so a misspelled policy setting
 cannot coexist with a valid setting unnoticed.
+
+New release-state evidence must use completion `evidence_version: 2` and carry
+all of `git_path`, `git_commit`, `zip_sha256`, `manifest_path`,
+`manifest_entry_sha256`, and `verified: true`. The App writes that same object
+to the release entry and every associated `retention_metadata[].completion`.
+The Git tombstone carries `evidence_version`, release ID/version,
+`sparkle_version`, `zip_sha256`, `manifest_path`, and
+`manifest_entry_sha256`. `git_commit` must be the full SHA of that tombstone
+commit on the App repository's `main` history. The canonical manifest entry
+digest is `sha256:` plus SHA-256 of the release object encoded as sorted,
+compact JSON after removing its top-level `completion` field. Excluding that
+field avoids a self-reference when the App records completion on the release
+entry. Missing `evidence_version` is accepted only for already-published legacy
+entries; those entries still undergo trusted-main, tombstone ZIP, and historical
+manifest checks, with bindings derived from the immutable commit.
+
 An abbreviated release looks like this:
 
 ```json

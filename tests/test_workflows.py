@@ -35,6 +35,7 @@ class RetentionWorkflowTests(unittest.TestCase):
     self.assertIn("Verify archive-backed retention metadata", workflow)
     self.assertIn("verify_evidence.py", workflow)
     self.assertIn("--archive-evidence", workflow)
+    self.assertIn("--metadata", workflow)
     self.assertIn("fetch-depth: 0", workflow)
 
   def test_apply_is_manual_caller_only_protected_and_uses_runner_local_rclone(self):
