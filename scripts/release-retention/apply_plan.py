@@ -20,17 +20,19 @@ from plan import (
   InventoryObject,
   canonical_sha256,
   load_manifest,
+  load_retention_metadata,
   parse_as_of,
   parse_inventory_value,
   require_key,
+  retention_metadata_sha256,
   sha256_file,
 )
 from verify_evidence import verify_archive_bytes, verify_metadata_bytes
 
 
 UTC = timezone.utc
-APPLY_CONTRACT_VERSION = 2
-SUPPORTED_PLAN_CONTRACT_VERSIONS = {1, 2}
+APPLY_CONTRACT_VERSION = 3
+SUPPORTED_PLAN_CONTRACT_VERSIONS = {3}
 ALLOWED_DELETE_REASONS = {
   "superseded-stable-patch": "stable-installer",
   "archived-stable-expired": "stable-installer",
@@ -146,6 +148,7 @@ def validate_plan(
   now: datetime,
   manifest_path: Optional[Path] = None,
   policy_path: Optional[Path] = None,
+  retention_metadata_dir: Optional[Path] = None,
 ) -> Tuple[Dict[str, Any], Dict[str, InventoryObject], Dict[str, InventoryObject]]:
   if not isinstance(plan, dict):
     raise ApplyError("plan must be a JSON object")
@@ -169,7 +172,7 @@ def validate_plan(
     raise ApplyError("plan storage target does not match the approved target")
   if plan.get("inventory_complete") is not True:
     raise ApplyError("plan was not generated from a complete inventory")
-  for field in ("manifest_sha256", "policy_sha256", "inventory_sha256"):
+  for field in ("manifest_sha256", "policy_sha256", "inventory_sha256", "retention_metadata_sha256"):
     if not isinstance(plan.get(field), str) or not SHA256_RE.fullmatch(plan[field]):
       raise ApplyError("plan {} must be a SHA-256 digest".format(field))
   try:
@@ -181,11 +184,14 @@ def validate_plan(
     raise ApplyError("plan has expired")
   if manifest_path is not None:
     try:
-      load_manifest(manifest_path)
+      load_manifest(manifest_path, retention_metadata_dir)
     except ValueError as error:
       raise ApplyError("manifest is invalid: {}".format(error)) from error
     if sha256_file(manifest_path) != plan.get("manifest_sha256"):
       raise ApplyError("manifest digest does not match the approved plan")
+    metadata_digest = retention_metadata_sha256(load_retention_metadata(retention_metadata_dir))
+    if metadata_digest != plan.get("retention_metadata_sha256"):
+      raise ApplyError("retention metadata digest does not match the approved plan")
   if policy_path is not None and sha256_file(policy_path) != plan.get("policy_sha256"):
     raise ApplyError("policy digest does not match the approved plan")
 
@@ -316,6 +322,7 @@ def apply_plan(
   github_repository: str = "",
   drive_remote: str = "gd_admin:",
   gh: str = "gh",
+  retention_metadata_dir: Optional[Path] = None,
 ) -> Tuple[int, Dict[str, Any]]:
   statuses: List[Dict[str, Any]] = []
   result: Dict[str, Any] = {
@@ -369,7 +376,7 @@ def apply_plan(
       }
       metadata = {
         item.get("object_key"): item
-        for item in manifest.get("retention_metadata", [])
+        for item in load_retention_metadata(retention_metadata_dir)
         if isinstance(item, dict)
       }
       delete_reasons = {
@@ -398,7 +405,6 @@ def apply_plan(
           verify_metadata_bytes(
             metadata_entry,
             manifest,
-            manifest_path,
             repository,
             drive_remote,
             rclone_bin,
@@ -490,6 +496,11 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
   parser.add_argument("--rclone-bin", default="rclone")
   parser.add_argument("--manifest", type=Path)
   parser.add_argument("--policy", type=Path)
+  parser.add_argument(
+    "--retention-metadata-dir",
+    type=Path,
+    help="directory of per-version release-state metadata files",
+  )
   parser.add_argument("--max-delete-objects", type=int, default=100)
   parser.add_argument("--max-delete-bytes", type=int, default=50 * 1024 * 1024 * 1024)
   parser.add_argument("--approval-id", default="")
@@ -527,6 +538,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
       started_at,
       args.manifest,
       args.policy,
+      args.retention_metadata_dir,
     )
     code, result = apply_plan(
       validated_plan,
@@ -545,6 +557,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
       args.github_repository,
       args.drive_remote,
       args.gh,
+      args.retention_metadata_dir,
     )
     write_result(args.result_output, result)
     return code

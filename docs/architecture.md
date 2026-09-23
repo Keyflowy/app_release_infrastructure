@@ -51,20 +51,41 @@ closed. Objects in sibling product prefixes are ignored. A missing delete
 candidate is the only tolerated drift and is recorded as `already-absent`.
 
 Protected metadata, live appcast references, unarchived stable installers, and
-unknown objects are never deletion candidates. Under policy v2, release-state
-metadata is eligible only after the plan workflow verifies its Drive MD5/size
-metadata and Git completion tombstone. Completion verification requires the
-declared commit to be reachable from `refs/remotes/origin/main`, loads the
-tombstone and manifest from that exact commit, and binds both to the current
-release entry and archive ZIP SHA-256. New callers emit completion evidence v2
-with explicit `zip_sha256`, `manifest_path`, and canonical
-`manifest_entry_sha256` fields. The same v2 completion object appears on the
-release entry and every associated release-state metadata entry; its Git
-tombstone repeats the version, manifest path, and both digests. The canonical
-entry identity excludes the release object's top-level `completion` field so
-recording the identity there does not become self-referential. Legacy entries
-without a version remain readable, but must satisfy the same derived
-trusted-history and digest checks.
+unknown objects are never deletion candidates. Under policy v2, the plan
+workflow runs a provisional plan that selects only the batched deletion
+candidates, verifies exactly those candidates from remote metadata, then
+rebuilds the plan bound to that evidence. A candidate whose verification fails
+is kept with reason `evidence-verification-failed`, reported in the plan's
+`evidence_failures`, and its batch slot is not refilled; an evidence document
+that does not match the recomputed candidates or input digests fails the whole
+plan as an integrity error.
+
+Release-state metadata lives in per-version
+`release-state-metadata/vX.Y.Z/metadata.json` files rather than inside the
+release manifest, because the two artifacts have different writers and
+concurrent jobs would otherwise conflict on the manifest file. Each file binds
+its entries to the release tag in its directory name, and the plan records a
+`retention_metadata_sha256` digest that apply re-verifies so a metadata file
+that changed after planning fails closed. Release-state metadata is eligible
+only after the plan workflow verifies its Drive MD5/size metadata and Git
+completion tombstone. Completion verification requires the declared commit to
+be reachable from `refs/remotes/origin/main`, loads the tombstone and manifest
+from that exact commit, and binds both to the current release entry and archive
+ZIP SHA-256. Completion evidence v3 carries exactly `evidence_version`,
+`git_path`, `git_commit`, `zip_sha256`, `manifest_path`,
+`manifest_entry_sha256`, and `verified`. The same v3 completion object appears
+on the release entry and every associated release-state metadata entry; its
+Git tombstone repeats the version, manifest path, and both digests.
+
+`manifest_entry_sha256` is the release's identity digest: `sha256:` plus
+SHA-256 of sorted, compact JSON over only the identity fields `version`,
+`feature_line`, `release_date`, `channel`, `notarization_status`,
+`full_zip_object_key`, `checksum`, `size_bytes`, and
+`sparkle_delta_object_keys`. Mutable evidence such as `archive` or
+`completion` never participates, so backfilling archive metadata after a
+release completes cannot invalidate its tombstone, and verification compares
+the historical entry's identity to the current identity rather than hashing
+the full historical entry. Evidence versions older than 3 are rejected.
 Archive-backed installers use GitHub
 asset `digest`, Drive MD5/size, and the manifest as the normal plan evidence;
 the plan does not download historical ZIPs. Immediately before any deletion,
@@ -92,6 +113,8 @@ ADR plus fixture-test updates there. A schema change must be additive or use a
 new schema version; the planner must reject an unknown version rather than
 guessing.
 
-Planner contract v2 adds archive evidence, live appcast binding, excluded
-prefixes, metadata evidence, and deterministic deferred batches. The v2 apply
-tool can still consume an immutable v1 plan, while new plans always use v2.
+Planner contract v3 replaces full-entry completion hashes with
+identity-field digests, moves retention metadata to per-version files digested
+into the plan, and verifies only the batched deletion candidates between a
+provisional and a final plan. The apply tool consumes contract 3 plans only;
+older immutable plans are no longer applicable.

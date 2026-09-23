@@ -43,6 +43,11 @@ on:
         description: Caller repository policy path
         required: true
         type: string
+      retention_metadata_dir:
+        description: Optional directory of per-version release-state metadata files
+        required: false
+        type: string
+        default: ""
       max_delete_objects:
         description: Maximum approved object count for one apply
         required: false
@@ -134,29 +139,38 @@ jobs:
           PLAN_ARTIFACT_ID: ${{ inputs.plan_artifact_id }}
           MANIFEST_PATH: ${{ inputs.manifest }}
           POLICY_PATH: ${{ inputs.policy }}
+          RETENTION_METADATA_DIR: ${{ inputs.retention_metadata_dir }}
           MAX_DELETE_OBJECTS: ${{ inputs.max_delete_objects }}
           MAX_DELETE_BYTES: ${{ inputs.max_delete_bytes }}
         run: |
           set -euo pipefail
           test -f "$PLAN_PATH"
-          python3 .release-infrastructure/scripts/release-retention/apply_plan.py \
-            --plan "$PLAN_PATH" \
-            --expected-plan-sha256 "$EXPECTED_PLAN_SHA256" \
-            --product "$PRODUCT" \
-            --rclone-remote "$RCLONE_REMOTE" \
-            --r2-prefix "$R2_PREFIX" \
-            --approval-id "$APPROVAL_ID" \
-            --plan-run-id "$PLAN_RUN_ID" \
-            --plan-artifact-id "$PLAN_ARTIFACT_ID" \
-            --manifest "$MANIFEST_PATH" \
-            --policy "$POLICY_PATH" \
-            --max-delete-objects "$MAX_DELETE_OBJECTS" \
-            --max-delete-bytes "$MAX_DELETE_BYTES" \
-            --github-repository "$GITHUB_REPOSITORY" \
-            --drive-remote gd_admin: \
-            --gh gh \
-            --result-output "$RUNNER_TEMP/apply-result.json" \
+
+          args=(
+            --plan "$PLAN_PATH"
+            --expected-plan-sha256 "$EXPECTED_PLAN_SHA256"
+            --product "$PRODUCT"
+            --rclone-remote "$RCLONE_REMOTE"
+            --r2-prefix "$R2_PREFIX"
+            --approval-id "$APPROVAL_ID"
+            --plan-run-id "$PLAN_RUN_ID"
+            --plan-artifact-id "$PLAN_ARTIFACT_ID"
+            --manifest "$MANIFEST_PATH"
+            --policy "$POLICY_PATH"
+            --max-delete-objects "$MAX_DELETE_OBJECTS"
+            --max-delete-bytes "$MAX_DELETE_BYTES"
+            --github-repository "$GITHUB_REPOSITORY"
+            --drive-remote gd_admin:
+            --gh gh
+            --result-output "$RUNNER_TEMP/apply-result.json"
             --execute
+          )
+
+          if [ -n "$RETENTION_METADATA_DIR" ]; then
+            args+=(--retention-metadata-dir "$RETENTION_METADATA_DIR")
+          fi
+
+          python3 .release-infrastructure/scripts/release-retention/apply_plan.py "${args[@]}"
 
       - name: Upload apply audit result
         if: ${{ always() }}

@@ -32,11 +32,40 @@ class RetentionWorkflowTests(unittest.TestCase):
     self.assertNotIn("ref: main", workflow)
     self.assertIn("Snapshot live appcast", workflow)
     self.assertIn('args+=(--appcast "$APPCAST_PATH")', workflow)
-    self.assertIn("Verify archive-backed retention metadata", workflow)
     self.assertIn("verify_evidence.py", workflow)
-    self.assertIn("--archive-evidence", workflow)
     self.assertIn("--metadata", workflow)
     self.assertIn("fetch-depth: 0", workflow)
+
+  def test_plan_workflow_verifies_only_the_batched_deletion_candidates(self):
+    workflow = self.workflow("reusable-retention-plan.yml")
+
+    order = [
+      workflow.index("Prepare complete R2 inventory"),
+      workflow.index("Snapshot live appcast"),
+      workflow.index("Pin plan timestamp"),
+      workflow.index("Build provisional deletion candidates"),
+      workflow.index("Verify deletion candidates"),
+      workflow.index("Build deterministic retention plan"),
+      workflow.index("Publish reviewed plan artifact"),
+    ]
+    self.assertEqual(order, sorted(order))
+
+    self.assertIn('if [ -n "$AS_OF_INPUT" ]; then', workflow)
+    self.assertIn("date -u +%Y-%m-%dT%H:%M:%SZ", workflow)
+    self.assertIn('--as-of "$AS_OF"', workflow)
+    self.assertIn("--candidates-output", workflow)
+    self.assertIn('--candidates "$RUNNER_TEMP/release-retention-candidates.json"', workflow)
+    self.assertIn('--candidate-evidence "$CANDIDATE_EVIDENCE_PATH"', workflow)
+    self.assertNotIn("--archive-evidence", workflow)
+    self.assertNotIn("rclone_metadata_index", workflow)
+    self.assertGreaterEqual(
+      workflow.count("if: ${{ inputs.rclone_remote != '' }}"),
+      3,
+    )
+    self.assertIn("retention_metadata_dir:", workflow)
+    self.assertIn('args+=(--retention-metadata-dir "$RETENTION_METADATA_DIR")', workflow)
+    self.assertIn("plan_artifact_id", workflow)
+    self.assertIn("plan_sha256", workflow)
 
   def test_apply_is_manual_caller_only_protected_and_uses_runner_local_rclone(self):
     workflow = self.workflow("reusable-retention-apply.yml")
@@ -50,6 +79,8 @@ class RetentionWorkflowTests(unittest.TestCase):
     self.assertNotIn("ref: main", workflow)
     self.assertIn("--github-repository", workflow)
     self.assertIn("--drive-remote gd_admin:", workflow)
+    self.assertIn("retention_metadata_dir:", workflow)
+    self.assertIn('args+=(--retention-metadata-dir "$RETENTION_METADATA_DIR")', workflow)
 
 
 if __name__ == "__main__":

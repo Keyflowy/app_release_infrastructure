@@ -41,12 +41,6 @@
       },
       "uniqueItems": true
     },
-    "retention_metadata": {
-      "type": "array",
-      "items": {
-        "$ref": "#/$defs/retentionMetadata"
-      }
-    },
     "releases": {
       "type": "array",
       "items": {
@@ -91,90 +85,27 @@
         "verified": {"type": "boolean"}
       }
     },
-    "metadataBackup": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["drive_object_key", "sha256", "size_bytes", "verified"],
-      "properties": {
-        "drive_object_key": {"$ref": "#/$defs/objectKey"},
-        "sha256": {"$ref": "#/$defs/sha256"},
-        "md5": {"type": "string", "pattern": "^[0-9a-fA-F]{32}$"},
-        "size_bytes": {"type": "integer", "minimum": 1},
-        "verified": {"type": "boolean"}
-      }
-    },
     "metadataCompletion": {
       "type": "object",
       "additionalProperties": false,
+      "required": [
+        "evidence_version",
+        "git_path",
+        "git_commit",
+        "zip_sha256",
+        "manifest_path",
+        "manifest_entry_sha256",
+        "verified"
+      ],
       "properties": {
-        "evidence_version": {"enum": [1, 2]},
+        "evidence_version": {"const": 3},
         "git_path": {"type": "string", "minLength": 1},
         "git_commit": {"type": "string", "pattern": "^[0-9a-fA-F]{40,64}$"},
         "zip_sha256": {"$ref": "#/$defs/sha256"},
         "manifest_path": {"$ref": "#/$defs/objectKey"},
         "manifest_entry_sha256": {"$ref": "#/$defs/sha256"},
-        "path": {"type": "string", "minLength": 1},
-        "commit": {"type": "string", "pattern": "^[0-9a-fA-F]{40,64}$"},
         "verified": {"type": "boolean"}
-      },
-      "required": ["verified"],
-      "allOf": [
-        {
-          "anyOf": [
-            {"required": ["git_path", "git_commit"]},
-            {"required": ["path", "commit"]}
-          ]
-        },
-        {
-          "if": {
-            "properties": {"evidence_version": {"const": 2}},
-            "required": ["evidence_version"]
-          },
-          "then": {
-            "required": [
-              "git_path",
-              "git_commit",
-              "zip_sha256",
-              "manifest_path",
-              "manifest_entry_sha256"
-            ],
-            "not": {
-              "anyOf": [
-                {"required": ["path"]},
-                {"required": ["commit"]}
-              ]
-            }
-          },
-          "else": {
-            "not": {
-              "anyOf": [
-                {"required": ["zip_sha256"]},
-                {"required": ["manifest_path"]},
-                {"required": ["manifest_entry_sha256"]}
-              ]
-            }
-          }
-        }
-      ]
-    },
-    "retentionMetadata": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["object_key", "release_date", "checksum", "size_bytes"],
-      "properties": {
-        "object_key": {"$ref": "#/$defs/objectKey"},
-        "release_date": {"type": "string", "format": "date"},
-        "checksum": {"$ref": "#/$defs/sha256"},
-        "size_bytes": {"type": "integer", "minimum": 1},
-        "backup": {"$ref": "#/$defs/metadataBackup"},
-        "drive_backup": {"$ref": "#/$defs/metadataBackup"},
-        "completion": {"$ref": "#/$defs/metadataCompletion"},
-        "git_completion_tombstone": {"$ref": "#/$defs/metadataCompletion"}
-      },
-      "allOf": [
-        {"anyOf": [{"required": ["backup"]}, {"required": ["drive_backup"]}]},
-        {"anyOf": [{"required": ["completion"]}, {"required": ["git_completion_tombstone"]}]}
-      ]
+      }
     },
     "releaseCompletion": {
       "allOf": [
@@ -182,18 +113,8 @@
         {
           "type": "object",
           "properties": {
-            "evidence_version": {"const": 2},
             "verified": {"const": true}
-          },
-          "required": [
-            "evidence_version",
-            "git_path",
-            "git_commit",
-            "zip_sha256",
-            "manifest_path",
-            "manifest_entry_sha256",
-            "verified"
-          ]
+          }
         }
       ]
     },

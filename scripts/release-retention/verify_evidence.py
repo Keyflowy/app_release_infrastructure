@@ -5,12 +5,19 @@ import argparse
 import hashlib
 import json
 import os
-import posixpath
 import re
 import subprocess
 import sys
 import time
 from pathlib import Path
+
+from plan import (
+  EVIDENCE_REASONS,
+  load_retention_metadata,
+  release_identity_sha256,
+  retention_metadata_sha256,
+  sha256_file,
+)
 
 
 SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -82,42 +89,6 @@ def metadata_from_entry(entry):
   if not isinstance(md5, str) or MD5_RE.fullmatch(md5.lower()) is None:
     raise ValueError("Drive metadata is missing an MD5 checksum")
   return {"size_bytes": size, "md5": md5.lower()}
-
-
-def rclone_metadata_index(rclone, drive_remote, object_keys):
-  if not object_keys:
-    return {}
-  directory = posixpath.commonpath(object_keys).rsplit("/", 1)[0] + "/"
-  payload = run_bytes([
-    rclone,
-    *RCLONE_TIMEOUT_FLAGS,
-    "lsjson",
-    "--recursive",
-    "--files-only",
-    "--hash",
-    "--no-mimetype",
-    remote_object(drive_remote, directory),
-  ])
-  try:
-    entries = json.loads(payload)
-  except json.JSONDecodeError as error:
-    raise ValueError("Drive metadata response is not JSON") from error
-  if not isinstance(entries, list):
-    raise ValueError("Drive metadata response is not an array")
-  index = {}
-  for entry in entries:
-    if not isinstance(entry, dict):
-      raise ValueError("Drive metadata entry is not an object")
-    relative = entry.get("Path")
-    if not isinstance(relative, str) or not relative:
-      raise ValueError("Drive metadata entry has no path")
-    key = relative if relative in object_keys else directory + relative
-    if key in object_keys:
-      index[key] = metadata_from_entry(entry)
-  missing = sorted(set(object_keys).difference(index))
-  if missing:
-    raise ValueError("Drive metadata did not identify object {}".format(missing[0]))
-  return index
 
 
 def rclone_metadata(rclone, object_path):
@@ -271,33 +242,12 @@ def verify_archive_bytes(release, repository, github_repository, drive_remote, r
   return {"github_sha256": github_checksum, "drive_sha256": drive_checksum, "size_bytes": expected_size}
 
 
-def canonical_sha256(value):
-  encoded = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
-  return "sha256:" + hashlib.sha256(encoded).hexdigest()
-
-
-def manifest_entry_sha256(release):
-  identity = dict(release)
-  identity.pop("completion", None)
-  return canonical_sha256(identity)
-
-
 def normalized_sha256(value, label):
   if isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value):
     return "sha256:" + value
   if not isinstance(value, str) or SHA256_RE.fullmatch(value) is None:
     raise ValueError("{} is not a SHA-256 checksum".format(label))
   return value
-
-
-def repository_manifest_path(manifest_path, repository):
-  path = Path(manifest_path)
-  if not path.is_absolute():
-    return path.as_posix()
-  try:
-    return path.resolve().relative_to(Path(repository).resolve()).as_posix()
-  except ValueError as error:
-    raise ValueError("manifest path is outside the caller repository") from error
 
 
 def release_entry(manifest, version, label):
@@ -317,7 +267,6 @@ def release_entry(manifest, version, label):
 def verify_completion(
   metadata,
   manifest,
-  manifest_path,
   repository,
   trusted_main_ref="refs/remotes/origin/main",
 ):
@@ -327,33 +276,18 @@ def verify_completion(
     raise ValueError("release metadata object key is not versioned")
   tag = match.group(1)
   version = tag.removeprefix("v")
-  completion = selected(metadata, "completion", "git_completion_tombstone", object_key)
-  git_path = completion.get("git_path", completion.get("path"))
-  git_commit = completion.get("git_commit", completion.get("commit"))
+  completion = metadata.get("completion")
+  if not isinstance(completion, dict):
+    raise ValueError("release metadata is missing a completion tombstone")
+  git_path = completion.get("git_path")
+  git_commit = completion.get("git_commit")
   if not isinstance(git_path, str) or not git_path.endswith("/{}.json".format(tag)):
     raise ValueError("release completion path does not match release tag")
   if not isinstance(git_commit, str) or re.fullmatch(r"[0-9a-fA-F]{40,64}", git_commit) is None:
     raise ValueError("release completion commit is invalid")
-
-  evidence_version = completion.get("evidence_version", 1)
-  if type(evidence_version) is not int or evidence_version not in (1, 2):
-    raise ValueError("release completion evidence_version must be 1 or 2")
-  binding_fields = {"zip_sha256", "manifest_path", "manifest_entry_sha256"}
-  present_bindings = binding_fields.intersection(completion)
-  if evidence_version == 1 and present_bindings:
-    raise ValueError("legacy release completion cannot contain v2 bindings")
-  if evidence_version == 2 and present_bindings != binding_fields:
-    raise ValueError("release completion v2 bindings are incomplete")
-  if evidence_version == 2 and (
-    "git_path" not in completion
-    or "git_commit" not in completion
-    or "path" in completion
-    or "commit" in completion
-  ):
-    raise ValueError("release completion v2 must use git_path and git_commit")
+  if completion.get("evidence_version") != 3:
+    raise ValueError("release completion evidence_version must be 3")
   bound_manifest_path = completion.get("manifest_path")
-  if bound_manifest_path is None:
-    bound_manifest_path = repository_manifest_path(manifest_path, repository)
   if (
     not isinstance(bound_manifest_path, str)
     or not bound_manifest_path
@@ -362,20 +296,27 @@ def verify_completion(
     or any(part in ("", ".", "..") for part in bound_manifest_path.split("/"))
   ):
     raise ValueError("release completion manifest path is invalid")
+  zip_sha256 = normalized_sha256(
+    completion.get("zip_sha256"),
+    "release completion ZIP digest",
+  )
+  completion_entry_sha256 = normalized_sha256(
+    completion.get("manifest_entry_sha256"),
+    "release completion manifest identity",
+  )
 
   current_release = release_entry(manifest, version, "current")
+  if current_release.get("completion") != completion:
+    raise ValueError("release completion evidence differs from the release entry")
   current_archive_sha256 = normalized_sha256(
     current_release.get("checksum"),
     "current release archive checksum",
   )
-  current_manifest_entry_sha256 = manifest_entry_sha256(current_release)
-  if evidence_version == 2:
-    if completion.get("zip_sha256") != current_archive_sha256:
-      raise ValueError("release completion ZIP digest differs from the manifest")
-    if completion.get("manifest_entry_sha256") != current_manifest_entry_sha256:
-      raise ValueError("release completion manifest identity differs")
-    if current_release.get("completion") != completion:
-      raise ValueError("release completion evidence differs from the release entry")
+  if zip_sha256 != current_archive_sha256:
+    raise ValueError("release completion ZIP digest differs from the manifest")
+  current_manifest_entry_sha256 = release_identity_sha256(current_release)
+  if completion_entry_sha256 != current_manifest_entry_sha256:
+    raise ValueError("release completion manifest identity differs")
 
   try:
     run_bytes([
@@ -402,32 +343,27 @@ def verify_completion(
     raise ValueError("release completion manifest is not JSON") from error
   if tombstone.get("release_id") != tag or tombstone.get("version") != version:
     raise ValueError("release completion tombstone identity differs")
-  tombstone_archive_sha256 = normalized_sha256(
+  if tombstone.get("evidence_version") != 3:
+    raise ValueError("release completion tombstone evidence version differs")
+  if tombstone.get("manifest_path") != bound_manifest_path:
+    raise ValueError("release completion tombstone manifest path differs")
+  if normalized_sha256(
+    tombstone.get("manifest_entry_sha256"),
+    "release completion tombstone manifest identity",
+  ) != completion_entry_sha256:
+    raise ValueError("release completion tombstone manifest identity differs")
+  if normalized_sha256(
     tombstone.get("zip_sha256"),
     "release completion tombstone ZIP digest",
-  )
-  if tombstone_archive_sha256 != current_archive_sha256:
-    raise ValueError("release completion tombstone ZIP digest differs from the manifest")
+  ) != zip_sha256:
+    raise ValueError("release completion tombstone ZIP digest differs from evidence")
   historical_release = release_entry(historical_manifest, version, "completion commit")
-  historical_manifest_entry_sha256 = manifest_entry_sha256(historical_release)
-  if historical_manifest_entry_sha256 != current_manifest_entry_sha256:
+  if release_identity_sha256(historical_release) != current_manifest_entry_sha256:
     raise ValueError("release completion manifest entry differs from the current manifest")
-  if evidence_version == 2:
-    if tombstone.get("evidence_version") != 2:
-      raise ValueError("release completion tombstone evidence version differs")
-    if tombstone.get("manifest_path") != bound_manifest_path:
-      raise ValueError("release completion tombstone manifest path differs")
-    if tombstone.get("manifest_entry_sha256") != current_manifest_entry_sha256:
-      raise ValueError("release completion tombstone manifest identity differs")
-    if normalized_sha256(
-      tombstone.get("zip_sha256"),
-      "release completion tombstone ZIP digest",
-    ) != completion["zip_sha256"]:
-      raise ValueError("release completion tombstone ZIP digest differs from evidence")
   return {
     "git_commit": git_commit.lower(),
     "git_path": git_path,
-    "zip_sha256": current_archive_sha256,
+    "zip_sha256": zip_sha256,
     "manifest_entry_sha256": current_manifest_entry_sha256,
   }
 
@@ -435,7 +371,6 @@ def verify_completion(
 def verify_metadata_bytes(
   metadata,
   manifest,
-  manifest_path,
   repository,
   drive_remote,
   rclone,
@@ -455,7 +390,6 @@ def verify_metadata_bytes(
   verify_completion(
     metadata,
     manifest,
-    manifest_path,
     repository,
     trusted_main_ref,
   )
@@ -471,117 +405,209 @@ def selected(value, primary, alias, label):
   return result
 
 
-def verify(
+def verify_metadata_candidate(
+  metadata,
+  manifest,
+  repository,
+  drive_remote,
+  rclone,
+  completions,
+  drive_metadata_cache,
+  trusted_main_ref,
+):
+  """Verify one expired-release-metadata candidate against live metadata."""
+  checksum = metadata.get("checksum")
+  size_bytes = metadata.get("size_bytes")
+  if not isinstance(checksum, str) or SHA256_RE.fullmatch(checksum) is None:
+    raise ValueError("candidate metadata has an invalid checksum")
+  if not isinstance(size_bytes, int) or isinstance(size_bytes, bool) or size_bytes <= 0:
+    raise ValueError("candidate metadata has an invalid size")
+
+  backup = selected(metadata, "backup", "drive_backup", metadata.get("object_key"))
+  completion = metadata.get("completion")
+  if not isinstance(completion, dict):
+    raise ValueError("candidate metadata is missing a completion tombstone")
+  if backup.get("verified") is not True or completion.get("verified") is not True:
+    raise ValueError("candidate metadata evidence is not marked verified")
+  if backup.get("sha256") != checksum or backup.get("size_bytes") != size_bytes:
+    raise ValueError("candidate Drive evidence differs from metadata")
+
+  drive_object_key = backup.get("drive_object_key")
+  if not isinstance(drive_object_key, str) or not drive_object_key:
+    raise ValueError("candidate Drive object key is invalid")
+  drive_md5 = backup.get("md5")
+  if not isinstance(drive_md5, str) or MD5_RE.fullmatch(drive_md5.lower()) is None:
+    raise ValueError("candidate Drive evidence is missing an MD5 checksum")
+  if drive_object_key not in drive_metadata_cache:
+    drive_metadata_cache[drive_object_key] = rclone_metadata(
+      rclone,
+      remote_object(drive_remote, drive_object_key),
+    )
+  actual = drive_metadata_cache[drive_object_key]
+  if actual["size_bytes"] != size_bytes or actual["md5"] != drive_md5.lower():
+    raise ValueError("candidate Drive metadata checksum or size differs")
+
+  identity = (completion.get("git_commit"), completion.get("git_path"))
+  if identity not in completions:
+    completions[identity] = verify_completion(
+      metadata,
+      manifest,
+      repository,
+      trusted_main_ref,
+    )
+  verified_completion = completions[identity]
+  return {
+    "drive_object_key": drive_object_key,
+    "drive_md5": actual["md5"],
+    "size_bytes": actual["size_bytes"],
+    "git_commit": verified_completion["git_commit"],
+    "git_path": verified_completion["git_path"],
+    "zip_sha256": verified_completion["zip_sha256"],
+    "manifest_entry_sha256": verified_completion["manifest_entry_sha256"],
+  }
+
+
+def verify_candidates(
   manifest_path,
+  candidates_path,
   repository,
   drive_remote,
   rclone,
   github_repository=None,
   gh="gh",
   trusted_main_ref="refs/remotes/origin/main",
+  retention_metadata_dir=None,
 ):
+  """Verify only the deletion candidates listed by a provisional plan."""
   with Path(manifest_path).open(encoding="utf-8") as source:
     manifest = json.load(source)
-  metadata_entries = manifest.get("retention_metadata", [])
-  if not isinstance(metadata_entries, list):
-    raise ValueError("retention_metadata must be an array")
-  completions = {}
-  verified_drive_objects = set()
-  drive_keys = [
-    metadata.get("backup", metadata.get("drive_backup", {})).get("drive_object_key")
-    for metadata in metadata_entries
-    if isinstance(metadata, dict)
-  ]
-  drive_keys.extend(
-    release.get("archive", {}).get("drive_object_key")
-    for release in manifest.get("releases", [])
-    if isinstance(release, dict) and isinstance(release.get("archive"), dict)
+  document = load_candidates_document(candidates_path)
+  metadata_entries = load_retention_metadata(
+    Path(retention_metadata_dir) if retention_metadata_dir is not None else None
   )
-  drive_index = rclone_metadata_index(rclone, drive_remote, [key for key in drive_keys if isinstance(key, str)])
-  for index, metadata in enumerate(metadata_entries):
-    label = "retention_metadata[{}]".format(index)
-    if not isinstance(metadata, dict):
+  if document["manifest_sha256"] != sha256_file(Path(manifest_path)):
+    raise ValueError("deletion candidates manifest digest does not match the manifest")
+  if document["retention_metadata_sha256"] != retention_metadata_sha256(metadata_entries):
+    raise ValueError("deletion candidates retention metadata digest does not match")
+
+  candidates = []
+  for index, candidate in enumerate(document["candidates"]):
+    label = "candidates[{}]".format(index)
+    if not isinstance(candidate, dict):
       raise ValueError("{} must be an object".format(label))
-    object_key = metadata.get("object_key")
-    match = STATE_KEY_RE.fullmatch(object_key or "")
-    if match is None:
-      raise ValueError("{} object_key is not a versioned release-state object".format(label))
-    tag = match.group(1)
-    checksum = metadata.get("checksum")
-    size_bytes = metadata.get("size_bytes")
-    if not isinstance(checksum, str) or SHA256_RE.fullmatch(checksum) is None:
-      raise ValueError("{} has an invalid checksum".format(label))
-    if not isinstance(size_bytes, int) or isinstance(size_bytes, bool) or size_bytes <= 0:
-      raise ValueError("{} has an invalid size".format(label))
+    key = candidate.get("key")
+    reason = candidate.get("reason")
+    if not isinstance(key, str) or not key:
+      raise ValueError("{} key is invalid".format(label))
+    if reason not in EVIDENCE_REASONS:
+      raise ValueError("{} reason {!r} is not a verifiable deletion reason".format(label, reason))
+    candidates.append({"key": key, "reason": reason})
+  candidates.sort(key=lambda item: item["key"])
 
-    backup = selected(metadata, "backup", "drive_backup", label)
-    completion = selected(metadata, "completion", "git_completion_tombstone", label)
-    if backup.get("verified") is not True or completion.get("verified") is not True:
-      raise ValueError("{} evidence is not marked verified".format(label))
-    if backup.get("sha256") != checksum or backup.get("size_bytes") != size_bytes:
-      raise ValueError("{} Drive evidence differs from metadata".format(label))
-
-    drive_object_key = backup.get("drive_object_key")
-    if not isinstance(drive_object_key, str) or not drive_object_key:
-      raise ValueError("{} Drive object key is invalid".format(label))
-    drive_md5 = backup.get("md5")
-    if not isinstance(drive_md5, str) or MD5_RE.fullmatch(drive_md5.lower()) is None:
-      raise ValueError("{} Drive evidence is missing an MD5 checksum".format(label))
-    drive_identity = (drive_object_key, drive_md5.lower(), size_bytes)
-    if drive_identity not in verified_drive_objects:
-      actual = drive_index.get(drive_object_key)
-      if actual is None:
-        raise ValueError("{} Drive metadata object is missing".format(label))
-      if actual["size_bytes"] != size_bytes or actual["md5"] != drive_md5.lower():
-        raise ValueError("{} Drive metadata checksum or size differs".format(label))
-      verified_drive_objects.add(drive_identity)
-
-    git_path = completion.get("git_path", completion.get("path"))
-    git_commit = completion.get("git_commit", completion.get("commit"))
-    if not isinstance(git_path, str) or not git_path.endswith("/{}.json".format(tag)):
-      raise ValueError("{} completion path does not match release tag".format(label))
-    identity = (git_commit, git_path)
-    if identity not in completions:
-      completions[identity] = verify_completion(
-        metadata,
-        manifest,
-        manifest_path,
-        repository,
-        trusted_main_ref,
+  metadata_by_key = {entry["object_key"]: entry for entry in metadata_entries}
+  completions = {}
+  drive_metadata_cache = {}
+  results = []
+  for candidate in candidates:
+    key = candidate["key"]
+    reason = candidate["reason"]
+    try:
+      if reason == "archived-stable-expired":
+        matches = [
+          release
+          for release in manifest.get("releases", [])
+          if isinstance(release, dict) and release.get("full_zip_object_key") == key
+        ]
+        if len(matches) != 1:
+          raise ValueError("candidate does not identify exactly one manifest release")
+        archive = verify_archive(
+          matches[0],
+          repository,
+          github_repository,
+          drive_remote,
+          rclone,
+          gh,
+          drive_index=None,
+        )
+        results.append({
+          "key": key,
+          "reason": reason,
+          "status": "verified",
+          "archive": archive,
+        })
+      else:
+        metadata = metadata_by_key.get(key)
+        if metadata is None:
+          raise ValueError("candidate has no retention metadata entry")
+        results.append({
+          "key": key,
+          "reason": reason,
+          "status": "verified",
+          "metadata": verify_metadata_candidate(
+            metadata,
+            manifest,
+            repository,
+            drive_remote,
+            rclone,
+            completions,
+            drive_metadata_cache,
+            trusted_main_ref,
+          ),
+        })
+    except ValueError as error:
+      results.append({
+        "key": key,
+        "reason": reason,
+        "status": "failed",
+        "error": str(error),
+      })
+      print(
+        "retention evidence: candidate {} failed verification: {}".format(key, error),
+        file=sys.stderr,
       )
 
-  archives = []
-  seen_archive_keys = set()
-  for release in manifest.get("releases", []):
-    if not isinstance(release, dict) or "archive" not in release:
-      continue
-    evidence = verify_archive(
-      release,
-      repository,
-      github_repository,
-      drive_remote,
-      rclone,
-      gh,
-      drive_index,
-    )
-    key = evidence["full_zip_object_key"]
-    if key in seen_archive_keys:
-      raise ValueError("duplicate archive evidence for {}".format(key))
-    seen_archive_keys.add(key)
-    archives.append(evidence)
-
   return {
-    "schema_version": 2,
-    "manifest_sha256": "sha256:" + hashlib.sha256(
-      Path(manifest_path).read_bytes()
-    ).hexdigest(),
-    "archives": sorted(archives, key=lambda item: item["full_zip_object_key"]),
+    "schema_version": 3,
+    "as_of": document["as_of"],
+    "manifest_sha256": document["manifest_sha256"],
+    "retention_metadata_sha256": document["retention_metadata_sha256"],
+    "inventory_sha256": document["inventory_sha256"],
+    "candidates": candidates,
+    "results": sorted(results, key=lambda item: item["key"]),
   }
+
+
+def load_candidates_document(candidates_path):
+  try:
+    document = json.loads(Path(candidates_path).read_text(encoding="utf-8"))
+  except json.JSONDecodeError as error:
+    raise ValueError("deletion candidates document is not JSON") from error
+  if not isinstance(document, dict):
+    raise ValueError("deletion candidates document must be a JSON object")
+  if document.get("schema_version") != 1:
+    raise ValueError("unsupported deletion candidates schema_version")
+  for field in ("as_of", "manifest_sha256", "retention_metadata_sha256", "inventory_sha256"):
+    if not isinstance(document.get(field), str) or not document[field]:
+      raise ValueError("deletion candidates {} is missing".format(field))
+  if not isinstance(document.get("candidates"), list):
+    raise ValueError("deletion candidates must be an array")
+  return document
 
 
 def main():
   parser = argparse.ArgumentParser(description=__doc__)
   parser.add_argument("--manifest", required=True, type=Path)
+  parser.add_argument(
+    "--candidates",
+    required=True,
+    type=Path,
+    help="deletion candidates document produced by plan.py --candidates-output",
+  )
+  parser.add_argument(
+    "--retention-metadata-dir",
+    type=Path,
+    help="directory of per-version release-state metadata files",
+  )
   parser.add_argument("--repository", default=Path("."), type=Path)
   parser.add_argument("--drive-remote", default="gd_admin:")
   parser.add_argument("--rclone", default="rclone")
@@ -595,20 +621,22 @@ def main():
   parser.add_argument("--output", type=Path)
   args = parser.parse_args()
   try:
-    evidence = verify(
+    evidence = verify_candidates(
       args.manifest,
+      args.candidates,
       args.repository,
       args.drive_remote,
       args.rclone,
       args.github_repository,
       args.gh,
       args.trusted_main_ref,
+      args.retention_metadata_dir,
     )
+    rendered = json.dumps(evidence, indent=2, sort_keys=True) + "\n"
     if args.output is not None:
-      args.output.write_text(
-        json.dumps(evidence, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-      )
+      args.output.write_text(rendered, encoding="utf-8")
+    else:
+      sys.stdout.write(rendered)
   except (OSError, ValueError, json.JSONDecodeError) as error:
     raise SystemExit("retention evidence: {}".format(error)) from error
 
