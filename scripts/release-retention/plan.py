@@ -19,9 +19,8 @@ from typing import Any, Dict, FrozenSet, Iterable, List, Optional, Sequence, Tup
 
 
 UTC = timezone.utc
-PLAN_CONTRACT_VERSION = 2
-PLANNER_VERSION = "2"
-LEGACY_PLANNER_VERSION = "1"
+PLAN_CONTRACT_VERSION = 3
+PLANNER_VERSION = "3"
 SEMVER_RE = re.compile(
   r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
   r"(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?"
@@ -38,7 +37,6 @@ MANIFEST_FIELDS = frozenset({
   "generated_at",
   "appcast_object_key",
   "protected_object_keys",
-  "retention_metadata",
   "appcast_referenced_object_keys",
   "releases",
 })
@@ -108,10 +106,9 @@ METADATA_FIELDS = frozenset({
   "size_bytes",
   "backup",
   "completion",
-  # These aliases are accepted so callers can use names that mirror the
-  # storage systems while the normalized planner representation stays flat.
+  # This alias is accepted so callers can use a name that mirrors the
+  # storage system while the normalized planner representation stays flat.
   "drive_backup",
-  "git_completion_tombstone",
 })
 BACKUP_FIELDS = frozenset({
   "drive_object_key",
@@ -127,10 +124,26 @@ COMPLETION_FIELDS = frozenset({
   "zip_sha256",
   "manifest_path",
   "manifest_entry_sha256",
-  "path",
-  "commit",
   "verified",
 })
+RELEASE_IDENTITY_FIELDS = (
+  "version",
+  "feature_line",
+  "release_date",
+  "channel",
+  "notarization_status",
+  "full_zip_object_key",
+  "checksum",
+  "size_bytes",
+  "sparkle_delta_object_keys",
+)
+RETENTION_METADATA_FILE_FIELDS = frozenset({
+  "schema_version",
+  "version",
+  "retention_metadata",
+})
+RETENTION_METADATA_KEY_RE = re.compile(r"^[^/]+/release-state/(v[0-9]+\.[0-9]+\.[0-9]+)/[^/]+$")
+EVIDENCE_REASONS = frozenset({"archived-stable-expired", "expired-release-metadata"})
 SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 GIT_COMMIT_RE = re.compile(r"^[0-9a-fA-F]{40,64}$")
 
@@ -490,8 +503,11 @@ def validate_metadata_completion(value: Any, label: str) -> Dict[str, Any]:
   if not isinstance(value, dict):
     raise ValueError("{} must be an object".format(label))
   reject_unknown_fields(value, COMPLETION_FIELDS, label)
-  path = _normalize_alias(value, "git_path", "path", label)
-  commit = _normalize_alias(value, "git_commit", "commit", label)
+  require_fields(value, COMPLETION_FIELDS, label)
+  if value["evidence_version"] != 3:
+    raise ValueError("{}.evidence_version must be 3".format(label))
+  path = value["git_path"]
+  commit = value["git_commit"]
   if not isinstance(path, str) or not path or path.startswith("/") or "\\" in path:
     raise ValueError("{}.git_path must be a repository-relative path".format(label))
   path_parts = path.split("/")
@@ -499,38 +515,20 @@ def validate_metadata_completion(value: Any, label: str) -> Dict[str, Any]:
     raise ValueError("{}.git_path must be normalized".format(label))
   if not isinstance(commit, str) or GIT_COMMIT_RE.fullmatch(commit) is None:
     raise ValueError("{}.git_commit must be a full Git commit SHA".format(label))
-  if not isinstance(value.get("verified"), bool):
+  if not isinstance(value["verified"], bool):
     raise ValueError("{}.verified must be boolean".format(label))
-  evidence_version = value.get("evidence_version", 1)
-  if type(evidence_version) is not int or evidence_version not in (1, 2):
-    raise ValueError("{}.evidence_version must be 1 or 2".format(label))
-  binding_fields = {"zip_sha256", "manifest_path", "manifest_entry_sha256"}
-  present_bindings = binding_fields.intersection(value)
-  if evidence_version == 1 and present_bindings:
-    raise ValueError("{} legacy evidence cannot contain v2 bindings".format(label))
-  if evidence_version == 2 and present_bindings != binding_fields:
-    raise ValueError("{} v2 evidence must contain all archive and manifest bindings".format(label))
-  if evidence_version == 2 and (
-    "git_path" not in value
-    or "git_commit" not in value
-    or "path" in value
-    or "commit" in value
-  ):
-    raise ValueError("{} v2 evidence must use git_path and git_commit".format(label))
-  result = {
-    "evidence_version": evidence_version,
+  return {
+    "evidence_version": 3,
     "git_path": path,
     "git_commit": commit.lower(),
-    "verified": value["verified"],
-  }
-  if evidence_version == 2:
-    result["zip_sha256"] = require_sha256(value["zip_sha256"], label + ".zip_sha256")
-    result["manifest_path"] = require_key(value["manifest_path"], label + ".manifest_path")
-    result["manifest_entry_sha256"] = require_sha256(
+    "zip_sha256": require_sha256(value["zip_sha256"], label + ".zip_sha256"),
+    "manifest_path": require_key(value["manifest_path"], label + ".manifest_path"),
+    "manifest_entry_sha256": require_sha256(
       value["manifest_entry_sha256"],
       label + ".manifest_entry_sha256",
-    )
-  return result
+    ),
+    "verified": value["verified"],
+  }
 
 
 def validate_retention_metadata(value: Any, label: str) -> Dict[str, Any]:
@@ -543,7 +541,7 @@ def validate_retention_metadata(value: Any, label: str) -> Dict[str, Any]:
   checksum = require_sha256(value["checksum"], label + ".checksum")
   size_bytes = require_positive_integer(value["size_bytes"], label + ".size_bytes")
   raw_backup = _normalize_alias(value, "backup", "drive_backup", label)
-  raw_completion = _normalize_alias(value, "completion", "git_completion_tombstone", label)
+  raw_completion = value.get("completion")
   if raw_backup is None:
     raise ValueError("{} is missing required field 'backup'".format(label))
   if raw_completion is None:
@@ -560,27 +558,77 @@ def validate_retention_metadata(value: Any, label: str) -> Dict[str, Any]:
   }
 
 
+def release_identity_sha256(release: Dict[str, Any]) -> str:
+  identity = {key: release[key] for key in RELEASE_IDENTITY_FIELDS if key in release}
+  return "sha256:" + canonical_sha256(identity)
+
+
 def validate_release_completion(release: Dict[str, Any], label: str) -> Dict[str, Any]:
   completion = validate_metadata_completion(release.get("completion"), label + ".completion")
-  if completion["evidence_version"] != 2:
-    raise ValueError("{}.completion must use evidence_version 2".format(label))
   if completion["verified"] is not True:
     raise ValueError("{}.completion.verified must be true".format(label))
   checksum = require_sha256(release.get("checksum"), label + ".checksum")
   if completion["zip_sha256"] != checksum:
     raise ValueError("{}.completion.zip_sha256 must match the release checksum".format(label))
-  identity = dict(release)
-  identity.pop("completion", None)
-  expected_identity = "sha256:" + canonical_sha256(identity)
-  if completion["manifest_entry_sha256"] != expected_identity:
+  if completion["manifest_entry_sha256"] != release_identity_sha256(release):
     raise ValueError("{}.completion.manifest_entry_sha256 must match the release identity".format(label))
   return completion
+
+
+def load_retention_metadata(directory: Optional[Path]) -> List[Dict[str, Any]]:
+  """Load per-version release-state metadata files.
+
+  Each ``vX.Y.Z/metadata.json`` document binds its entries to the release tag
+  encoded in its directory name, so a file can only describe its own version.
+  """
+  if directory is None:
+    return []
+  if not directory.is_dir():
+    raise ValueError("retention metadata directory does not exist: {}".format(directory))
+  entries: List[Dict[str, Any]] = []
+  seen_keys = set()
+  for metadata_path in sorted(directory.glob("v*/metadata.json")):
+    tag = metadata_path.parent.name
+    document = load_json(metadata_path)
+    if not isinstance(document, dict):
+      raise ValueError("{} must be a JSON object".format(metadata_path))
+    reject_unknown_fields(document, RETENTION_METADATA_FILE_FIELDS, str(metadata_path))
+    require_fields(document, RETENTION_METADATA_FILE_FIELDS, str(metadata_path))
+    if document["schema_version"] != 1:
+      raise ValueError("{} schema_version must be 1".format(metadata_path))
+    version = document["version"]
+    if not isinstance(version, str) or "v" + version != tag:
+      raise ValueError("{} version does not match its directory".format(metadata_path))
+    raw_entries = document["retention_metadata"]
+    if not isinstance(raw_entries, list):
+      raise ValueError("{} retention_metadata must be an array".format(metadata_path))
+    for index, entry in enumerate(raw_entries):
+      entry_label = "{} retention_metadata[{}]".format(metadata_path, index)
+      if not isinstance(entry, dict):
+        raise ValueError("{} must be an object".format(entry_label))
+      object_key = entry.get("object_key")
+      match = (
+        RETENTION_METADATA_KEY_RE.fullmatch(object_key)
+        if isinstance(object_key, str)
+        else None
+      )
+      if match is None or match.group(1) != tag:
+        raise ValueError("{} object_key does not match release tag {}".format(entry_label, tag))
+      if object_key in seen_keys:
+        raise ValueError("duplicate retention metadata object key {}".format(object_key))
+      seen_keys.add(object_key)
+      validate_retention_metadata(entry, entry_label)
+      entries.append(entry)
+  return sorted(entries, key=lambda item: item["object_key"])
+
+
+def retention_metadata_sha256(entries: Sequence[Dict[str, Any]]) -> str:
+  return canonical_sha256(entries)
 
 
 def archive_is_verified(
   descriptor: Artifact,
   inventory_object: Optional[InventoryObject] = None,
-  evidence_keys: FrozenSet[str] = frozenset(),
 ) -> bool:
   archive = descriptor.archive
   if descriptor.kind != "stable-installer" or archive is None:
@@ -588,8 +636,6 @@ def archive_is_verified(
   if descriptor.checksum is None or descriptor.size_bytes is None:
     return False
   if not SHA256_RE.fullmatch(descriptor.checksum):
-    return False
-  if descriptor.key not in evidence_keys:
     return False
   manifest_matches = (
     archive.get("verified") is True
@@ -627,84 +673,107 @@ def metadata_is_verified(
   return True
 
 
-def load_archive_evidence(
+def load_candidate_evidence(
   path: Path,
-  manifest_path: Path,
-  artifacts: Dict[str, List[Artifact]],
-) -> FrozenSet[str]:
-  """Validate live GitHub/Drive metadata before allowing deletion."""
+  as_of: str,
+  manifest_digest: str,
+  retention_metadata_digest: str,
+  inventory_digest_value: str,
+  candidates: Sequence[Dict[str, Any]],
+) -> Dict[str, Dict[str, Any]]:
+  """Bind a candidate-verification document to this exact plan evaluation."""
   evidence = load_json(path)
   if not isinstance(evidence, dict):
-    raise ValueError("archive evidence must be a JSON object")
-  evidence_version = evidence.get("schema_version")
-  if evidence_version not in (1, 2):
-    raise ValueError("unsupported archive evidence schema_version")
-  manifest_digest = evidence.get("manifest_sha256")
-  expected_manifest_digest = "sha256:" + sha256_file(manifest_path)
-  if manifest_digest != expected_manifest_digest:
-    raise ValueError("archive evidence manifest digest does not match the plan manifest")
-  entries = evidence.get("archives")
-  if not isinstance(entries, list):
-    raise ValueError("archive evidence archives must be an array")
-
-  archive_descriptors = {
-    descriptor.key: descriptor
-    for descriptors in artifacts.values()
-    for descriptor in descriptors
-    if descriptor.archive is not None
-  }
-  verified_keys = set()
-  for index, entry in enumerate(entries):
-    label = "archive evidence archives[{}]".format(index)
-    if not isinstance(entry, dict):
+    raise ValueError("candidate evidence must be a JSON object")
+  if evidence.get("schema_version") != 3:
+    raise ValueError("unsupported candidate evidence schema_version")
+  expected_candidates = [
+    {"key": item["key"], "reason": item["reason"]}
+    for item in candidates
+  ]
+  if (
+    evidence.get("as_of") != as_of
+    or evidence.get("manifest_sha256") != manifest_digest
+    or evidence.get("retention_metadata_sha256") != retention_metadata_digest
+    or evidence.get("inventory_sha256") != inventory_digest_value
+    or evidence.get("candidates") != expected_candidates
+  ):
+    raise ValueError("candidate evidence does not match this plan's inputs")
+  results = evidence.get("results")
+  if not isinstance(results, list):
+    raise ValueError("candidate evidence results must be an array")
+  candidate_reasons = {item["key"]: item["reason"] for item in candidates}
+  results_by_key: Dict[str, Dict[str, Any]] = {}
+  for index, result in enumerate(results):
+    label = "candidate evidence results[{}]".format(index)
+    if not isinstance(result, dict):
       raise ValueError("{} must be an object".format(label))
-    key = require_key(entry.get("full_zip_object_key"), label + ".full_zip_object_key")
-    if key in verified_keys:
-      raise ValueError("duplicate archive evidence for {}".format(key))
-    descriptor = archive_descriptors.get(key)
-    if descriptor is None or descriptor.archive is None:
-      raise ValueError("{} does not match a manifest archive".format(label))
-    archive = descriptor.archive
-    if (
-      entry.get("version") is None
-      or entry.get("version") != ".".join(str(part) for part in descriptor.version or ())
-      or entry.get("github_release_id") != archive.get("github_release_id")
-      or entry.get("github_asset_id") != archive.get("github_asset_id")
-      or entry.get("github_asset_name") != archive.get("github_asset_name")
-      or entry.get("drive_object_key") != archive.get("drive_object_key")
-      or entry.get("verified") is not True
-    ):
-      raise ValueError("{} identity does not match the manifest archive".format(label))
-    github_size = require_positive_integer(entry.get("github_asset_size_bytes"), label + ".github_asset_size_bytes")
-    drive_size = require_positive_integer(entry.get("drive_size_bytes"), label + ".drive_size_bytes")
-    if evidence_version == 1:
-      github_checksum = require_sha256(entry.get("github_asset_sha256"), label + ".github_asset_sha256")
-      drive_checksum = require_sha256(entry.get("drive_sha256"), label + ".drive_sha256")
-      if (
-        github_checksum != descriptor.checksum
-        or drive_checksum != descriptor.checksum
-        or github_size != descriptor.size_bytes
-        or drive_size != descriptor.size_bytes
-      ):
-        raise ValueError("{} checksum or size does not match the manifest archive".format(label))
-    else:
-      github_digest = require_sha256(entry.get("github_asset_digest"), label + ".github_asset_digest")
-      drive_md5 = require_md5(entry.get("drive_md5"), label + ".drive_md5")
-      archive = descriptor.archive
-      if (
-        github_digest != archive.get("github_asset_digest")
-        or drive_md5 != archive.get("drive_md5", "").lower()
-        or github_digest != descriptor.checksum
-        or github_size != descriptor.size_bytes
-        or drive_size != descriptor.size_bytes
-      ):
-        raise ValueError("{} metadata or size does not match the manifest archive".format(label))
-    verified_keys.add(key)
+    key = result.get("key")
+    if key not in candidate_reasons:
+      raise ValueError("{} does not match a deletion candidate".format(label))
+    if key in results_by_key:
+      raise ValueError("duplicate candidate evidence for {}".format(key))
+    if result.get("reason") != candidate_reasons[key]:
+      raise ValueError("{} reason does not match its candidate".format(label))
+    if result.get("status") not in ("verified", "failed"):
+      raise ValueError("{} status is invalid".format(label))
+    results_by_key[key] = result
+  return results_by_key
 
-  missing = sorted(set(archive_descriptors).difference(verified_keys))
-  if missing:
-    raise ValueError("archive evidence is missing manifest archive {}".format(missing[0]))
-  return frozenset(verified_keys)
+
+def candidate_result_error(
+  candidate: Dict[str, Any],
+  result: Optional[Dict[str, Any]],
+  archive_descriptors: Dict[str, Artifact],
+  metadata_index: Dict[str, Dict[str, Any]],
+) -> Optional[str]:
+  """Return None when verified candidate evidence matches the plan inputs."""
+  if result is None:
+    return "candidate has no verification result"
+  if result.get("status") != "verified":
+    error = result.get("error")
+    if isinstance(error, str) and error:
+      return error
+    return "candidate verification did not succeed"
+  if candidate["reason"] == "archived-stable-expired":
+    descriptor = archive_descriptors.get(candidate["key"])
+    archive_result = result.get("archive")
+    if descriptor is None or descriptor.archive is None or not isinstance(archive_result, dict):
+      return "candidate evidence does not match the manifest archive"
+    archive = descriptor.archive
+    expected_digest = archive.get("github_asset_digest", archive.get("github_asset_sha256"))
+    if not (
+      archive_result.get("version") == ".".join(str(part) for part in descriptor.version or ())
+      and archive_result.get("github_release_id") == archive.get("github_release_id")
+      and archive_result.get("github_asset_id") == archive.get("github_asset_id")
+      and archive_result.get("github_asset_name") == archive.get("github_asset_name")
+      and archive_result.get("drive_object_key") == archive.get("drive_object_key")
+      and archive_result.get("verified") is True
+      and archive_result.get("github_asset_digest") == expected_digest
+      and archive_result.get("github_asset_digest") == descriptor.checksum
+      and archive_result.get("drive_md5") == str(archive.get("drive_md5", "")).lower()
+      and archive_result.get("github_asset_size_bytes") == descriptor.size_bytes
+      and archive_result.get("drive_size_bytes") == descriptor.size_bytes
+    ):
+      return "candidate archive evidence does not match the manifest"
+    return None
+  metadata = metadata_index.get(candidate["key"])
+  metadata_result = result.get("metadata")
+  if metadata is None or not isinstance(metadata_result, dict):
+    return "candidate evidence does not match the retention metadata"
+  backup = metadata["backup"]
+  completion = metadata["completion"]
+  if not (
+    metadata_result.get("drive_object_key") == backup.get("drive_object_key")
+    and metadata_result.get("drive_md5") == str(backup.get("md5", "")).lower()
+    and metadata_result.get("size_bytes") == metadata.get("size_bytes")
+    and metadata_result.get("git_commit") == completion.get("git_commit")
+    and metadata_result.get("git_path") == completion.get("git_path")
+    and metadata_result.get("zip_sha256") == completion.get("zip_sha256")
+    and metadata_result.get("manifest_entry_sha256") == completion.get("manifest_entry_sha256")
+  ):
+    return "candidate metadata evidence does not match the retention metadata"
+  return None
 
 
 def parse_inventory_value(raw: Any) -> List[InventoryObject]:
@@ -905,7 +974,10 @@ def add_artifact(
   ))
 
 
-def load_manifest(path: Path) -> Tuple[Dict[str, List[Artifact]], str]:
+def load_manifest(
+  path: Path,
+  retention_metadata_dir: Optional[Path] = None,
+) -> Tuple[Dict[str, List[Artifact]], str]:
   manifest = load_json(path)
   if not isinstance(manifest, dict):
     raise ValueError("manifest must be a JSON object")
@@ -946,15 +1018,12 @@ def load_manifest(path: Path) -> Tuple[Dict[str, List[Artifact]], str]:
     add_artifact(artifacts, protected_key, "protected-metadata")
   require_unique(protected_keys, "protected_object_keys")
 
-  raw_retention_metadata = manifest.get("retention_metadata", [])
-  if not isinstance(raw_retention_metadata, list):
-    raise ValueError("retention_metadata must be an array")
-  v2_metadata_completions = []
+  raw_retention_metadata = load_retention_metadata(retention_metadata_dir)
+  metadata_completions = []
   for index, raw_metadata in enumerate(raw_retention_metadata):
     label = "retention_metadata[{}]".format(index)
     metadata = validate_retention_metadata(raw_metadata, label)
-    if metadata["completion"]["evidence_version"] == 2:
-      v2_metadata_completions.append(metadata["completion"])
+    metadata_completions.append(metadata["completion"])
     add_artifact(
       artifacts,
       metadata["object_key"],
@@ -1057,9 +1126,9 @@ def load_manifest(path: Path) -> Tuple[Dict[str, List[Artifact]], str]:
         feature_line=feature_line,
       )
     require_unique(normalized_delta_keys, label + ".sparkle_delta_object_keys")
-  for completion in v2_metadata_completions:
+  for completion in metadata_completions:
     if completion not in release_completions:
-      raise ValueError("retention metadata v2 completion has no matching release completion")
+      raise ValueError("retention metadata completion has no matching release completion")
   return artifacts, product
 
 
@@ -1087,7 +1156,6 @@ def decide_descriptor(
   appcast_references: FrozenSet[str] = frozenset(),
   metadata_cutoff: Optional[date] = None,
   inventory_object: Optional[InventoryObject] = None,
-  archive_evidence_keys: FrozenSet[str] = frozenset(),
 ) -> Tuple[str, str]:
   if descriptor.kind == "protected-metadata":
     return "keep", "protected-metadata"
@@ -1111,7 +1179,7 @@ def decide_descriptor(
     if descriptor.release_date is not None and descriptor.release_date >= recent_cutoff:
       return "keep", "recent-stable"
     if archive_policy:
-      if archive_is_verified(descriptor, inventory_object, archive_evidence_keys):
+      if archive_is_verified(descriptor, inventory_object):
         return "delete", "archived-stable-expired"
       return "keep", "awaiting-archive-verification"
     if (
@@ -1191,10 +1259,12 @@ def build_plan(
   r2_prefix: Optional[str] = None,
   plan_ttl_hours: int = 24,
   appcast_path: Optional[Path] = None,
-  archive_evidence_path: Optional[Path] = None,
+  candidate_evidence_path: Optional[Path] = None,
   appcast_references: Optional[Sequence[str]] = None,
   max_delete_objects: Optional[int] = None,
   max_delete_bytes: Optional[int] = None,
+  retention_metadata_dir: Optional[Path] = None,
+  provisional: bool = False,
 ) -> Dict[str, Any]:
   if plan_ttl_hours <= 0:
     raise ValueError("plan_ttl_hours must be positive")
@@ -1203,7 +1273,8 @@ def build_plan(
   if rclone_remote is not None and r2_prefix is not None:
     validate_storage(rclone_remote, r2_prefix)
   policy = load_policy(policy_path)
-  artifacts, product = load_manifest(manifest_path)
+  metadata_entries = load_retention_metadata(retention_metadata_dir)
+  artifacts, product = load_manifest(manifest_path, retention_metadata_dir)
   archive_policy = policy["policy_version"] >= 2
   manifest = load_json(manifest_path)
   if (
@@ -1214,21 +1285,15 @@ def build_plan(
     and appcast_path is None
   ):
     raise ValueError("policy v2 complete plans require a live appcast snapshot")
-  archive_descriptors = {
-    descriptor.key
-    for descriptors in artifacts.values()
-    for descriptor in descriptors
-    if descriptor.archive is not None
-  }
-  archive_evidence_keys = frozenset()
-  if archive_policy and inventory_path is not None and archive_descriptors:
-    if archive_evidence_path is None:
-      raise ValueError("policy v2 complete plans require archive evidence")
-    archive_evidence_keys = load_archive_evidence(
-      archive_evidence_path,
-      manifest_path,
-      artifacts,
-    )
+  if provisional and candidate_evidence_path is not None:
+    raise ValueError("provisional plans do not take candidate evidence")
+  if (
+    not provisional
+    and archive_policy
+    and inventory_path is not None
+    and candidate_evidence_path is None
+  ):
+    raise ValueError("policy v2 complete plans require candidate evidence")
   excluded_prefixes = list(policy.get("excluded_prefixes", []))
   cache_prefix = policy.get("fallback_cache_prefix", "")
   if cache_prefix and cache_prefix not in excluded_prefixes:
@@ -1293,7 +1358,6 @@ def build_plan(
         frozenset(parsed_appcast_references),
         metadata_cutoff,
         item,
-        archive_evidence_keys,
       )
       for descriptor in descriptors
     ]
@@ -1329,6 +1393,65 @@ def build_plan(
     deferred_entry["reason"] = "deferred-delete-batch"
     keep.append(deferred_entry)
 
+  as_of_string = reference_time.isoformat().replace("+00:00", "Z")
+  manifest_digest = sha256_file(manifest_path)
+  metadata_digest = retention_metadata_sha256(metadata_entries)
+  scoped_inventory_digest = inventory_digest(inventory)
+  evidence_candidates = [
+    item for item in selected_delete if item["reason"] in EVIDENCE_REASONS
+  ]
+  evidence_failures: List[Dict[str, Any]] = []
+  demoted: List[Dict[str, Any]] = []
+  demoted_reason = "awaiting-evidence-verification"
+  if candidate_evidence_path is not None:
+    archive_descriptors = {
+      descriptor.key: descriptor
+      for descriptors in artifacts.values()
+      for descriptor in descriptors
+      if descriptor.archive is not None
+    }
+    metadata_index = {}
+    for index, raw_metadata in enumerate(metadata_entries):
+      metadata = validate_retention_metadata(
+        raw_metadata,
+        "retention_metadata[{}]".format(index),
+      )
+      metadata_index[metadata["object_key"]] = metadata
+    evidence_results = load_candidate_evidence(
+      candidate_evidence_path,
+      as_of_string,
+      manifest_digest,
+      metadata_digest,
+      scoped_inventory_digest,
+      evidence_candidates,
+    )
+    demoted_reason = "evidence-verification-failed"
+    for candidate in evidence_candidates:
+      error = candidate_result_error(
+        candidate,
+        evidence_results.get(candidate["key"]),
+        archive_descriptors,
+        metadata_index,
+      )
+      if error is not None:
+        demoted.append(candidate)
+        evidence_failures.append({
+          "key": candidate["key"],
+          "reason": candidate["reason"],
+          "error": error,
+        })
+  elif not provisional and inventory_path is None:
+    # A complete inventory is required before evidence can be collected, so
+    # evidence-requiring candidates wait for the next complete plan.
+    demoted = list(evidence_candidates)
+  if demoted:
+    demoted_keys = {item["key"] for item in demoted}
+    selected_delete = [item for item in selected_delete if item["key"] not in demoted_keys]
+    for item in demoted:
+      keep_entry = dict(item)
+      keep_entry["reason"] = demoted_reason
+      keep.append(keep_entry)
+
   keep.sort(key=lambda item: item["key"])
   selected_delete.sort(key=lambda item: item["key"])
   deferred_delete.sort(key=lambda item: item["key"])
@@ -1338,17 +1461,18 @@ def build_plan(
     "product": product,
     "rclone_remote": rclone_remote,
     "r2_prefix": r2_prefix,
-    "as_of": reference_time.isoformat().replace("+00:00", "Z"),
+    "as_of": as_of_string,
     "expires_at": (reference_time + timedelta(hours=plan_ttl_hours)).isoformat().replace("+00:00", "Z"),
     "inventory_complete": inventory_path is not None,
     "policy_version": policy["policy_version"],
     "excluded_prefixes": excluded_prefixes,
     "appcast_references": sorted(parsed_appcast_references),
     "appcast_sha256": sha256_file(appcast_path) if appcast_path is not None else None,
-    "archive_evidence_sha256": sha256_file(archive_evidence_path) if archive_evidence_path is not None else None,
-    "manifest_sha256": sha256_file(manifest_path),
+    "candidate_evidence_sha256": sha256_file(candidate_evidence_path) if candidate_evidence_path is not None else None,
+    "manifest_sha256": manifest_digest,
+    "retention_metadata_sha256": metadata_digest,
     "policy_sha256": sha256_file(policy_path),
-    "inventory_sha256": inventory_digest(inventory),
+    "inventory_sha256": scoped_inventory_digest,
     "cutoffs": {
       "recent_stable": recent_cutoff.isoformat(),
       "sparkle_delta": delta_cutoff.isoformat(),
@@ -1358,6 +1482,7 @@ def build_plan(
     "keep": keep,
     "delete": selected_delete,
     "deferred": deferred_delete,
+    "evidence_failures": evidence_failures,
     "batch": {
       "max_objects": configured_max_objects,
       "max_bytes": configured_max_bytes,
@@ -1372,6 +1497,7 @@ def build_plan(
       "deferred_count": len(deferred_delete),
       "delete_bytes": sum(item.get("size_bytes", 0) for item in selected_delete),
       "deferred_bytes": sum(item.get("size_bytes", 0) for item in deferred_delete),
+      "evidence_failure_count": len(evidence_failures),
     },
   }
   payload["plan_id"] = canonical_sha256(payload)
@@ -1414,9 +1540,19 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     help="snapshot of the live appcast whose enclosure and delta objects must be retained",
   )
   parser.add_argument(
-    "--archive-evidence",
+    "--candidate-evidence",
     type=Path,
-    help="metadata evidence from GitHub Releases and Drive for every manifest archive",
+    help="verification results for this plan's deletion candidates",
+  )
+  parser.add_argument(
+    "--candidates-output",
+    type=Path,
+    help="write a provisional plan's deletion candidates to this file instead of a plan",
+  )
+  parser.add_argument(
+    "--retention-metadata-dir",
+    type=Path,
+    help="directory of per-version release-state metadata files",
   )
   parser.add_argument("--max-delete-objects", type=int)
   parser.add_argument("--max-delete-bytes", type=int)
@@ -1432,7 +1568,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 def main(argv: Optional[Sequence[str]] = None) -> int:
   args = parse_args(argv)
   try:
-    plan = build_plan(
+    retention_plan = build_plan(
       args.manifest,
       args.policy,
       args.inventory,
@@ -1441,12 +1577,33 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
       args.r2_prefix,
       args.plan_ttl_hours,
       args.appcast,
-      args.archive_evidence,
+      args.candidate_evidence,
       None,
       args.max_delete_objects,
       args.max_delete_bytes,
+      args.retention_metadata_dir,
+      provisional=args.candidates_output is not None,
     )
-    rendered = render_text(plan) if args.format == "text" else json.dumps(plan, indent=2) + "\n"
+    if args.candidates_output is not None:
+      candidates = [
+        {"key": item["key"], "reason": item["reason"]}
+        for item in retention_plan["delete"]
+        if item["reason"] in EVIDENCE_REASONS
+      ]
+      document = {
+        "schema_version": 1,
+        "as_of": retention_plan["as_of"],
+        "manifest_sha256": retention_plan["manifest_sha256"],
+        "retention_metadata_sha256": retention_plan["retention_metadata_sha256"],
+        "inventory_sha256": retention_plan["inventory_sha256"],
+        "candidates": candidates,
+      }
+      args.candidates_output.write_text(
+        json.dumps(document, indent=2) + "\n",
+        encoding="utf-8",
+      )
+      return 0
+    rendered = render_text(retention_plan) if args.format == "text" else json.dumps(retention_plan, indent=2) + "\n"
     if args.output is None:
       sys.stdout.write(rendered)
     else:

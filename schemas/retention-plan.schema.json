@@ -18,20 +18,22 @@
     "excluded_prefixes",
     "appcast_references",
     "appcast_sha256",
-    "archive_evidence_sha256",
+    "candidate_evidence_sha256",
     "manifest_sha256",
+    "retention_metadata_sha256",
     "policy_sha256",
     "inventory_sha256",
     "cutoffs",
     "keep",
     "delete",
     "deferred",
+    "evidence_failures",
     "batch",
     "summary",
     "plan_id"
   ],
   "properties": {
-    "contract_version": { "const": 2 },
+    "contract_version": { "const": 3 },
     "planner_version": { "type": "string", "minLength": 1 },
     "product": { "type": "string", "minLength": 1 },
     "rclone_remote": { "type": ["string", "null"] },
@@ -56,13 +58,14 @@
         {"type": "null"}
       ]
     },
-    "archive_evidence_sha256": {
+    "candidate_evidence_sha256": {
       "anyOf": [
         {"$ref": "#/$defs/sha256"},
         {"type": "null"}
       ]
     },
     "manifest_sha256": { "$ref": "#/$defs/sha256" },
+    "retention_metadata_sha256": { "$ref": "#/$defs/sha256" },
     "policy_sha256": { "$ref": "#/$defs/sha256" },
     "inventory_sha256": { "$ref": "#/$defs/sha256" },
     "cutoffs": {
@@ -79,6 +82,10 @@
     "keep": { "type": "array", "items": { "$ref": "#/$defs/entry" } },
     "delete": { "type": "array", "items": { "$ref": "#/$defs/entry" } },
     "deferred": {"type": "array", "items": {"$ref": "#/$defs/entry"}},
+    "evidence_failures": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/evidenceFailure"}
+    },
     "batch": {
       "type": "object",
       "additionalProperties": false,
@@ -93,7 +100,7 @@
     "summary": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["keep_count", "delete_count", "unknown_count", "excluded_count", "deferred_count", "delete_bytes", "deferred_bytes"],
+      "required": ["keep_count", "delete_count", "unknown_count", "excluded_count", "deferred_count", "delete_bytes", "deferred_bytes", "evidence_failure_count"],
       "properties": {
         "keep_count": { "type": "integer", "minimum": 0 },
         "delete_count": { "type": "integer", "minimum": 0 },
@@ -101,7 +108,8 @@
         "excluded_count": {"type": "integer", "minimum": 0},
         "deferred_count": {"type": "integer", "minimum": 0},
         "delete_bytes": { "type": "integer", "minimum": 0 },
-        "deferred_bytes": {"type": "integer", "minimum": 0}
+        "deferred_bytes": {"type": "integer", "minimum": 0},
+        "evidence_failure_count": {"type": "integer", "minimum": 0}
       }
     },
     "plan_id": { "$ref": "#/$defs/sha256" }
@@ -124,6 +132,16 @@
         "hashes": { "type": "object", "additionalProperties": { "type": "string", "minLength": 1 } },
         "object_id": { "type": "string", "minLength": 1 },
         "metadata": { "type": "object", "additionalProperties": { "type": "string" } }
+      }
+    },
+    "evidenceFailure": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["key", "reason", "error"],
+      "properties": {
+        "key": { "type": "string", "minLength": 1 },
+        "reason": { "type": "string", "minLength": 1 },
+        "error": { "type": "string", "minLength": 1 }
       }
     }
   }

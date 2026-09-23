@@ -96,6 +96,89 @@ class RetentionApplyTests(unittest.TestCase):
     self.assertEqual(code, 2)
     run.assert_not_called()
 
+  def test_rejects_the_plan_when_metadata_changed_after_planning(self):
+    directory = tempfile.TemporaryDirectory()
+    self.addCleanup(directory.cleanup)
+    path = Path(directory.name)
+    release_item = release("3.1.0", "2024-01-01")
+    release_item["checksum"] = "sha256:" + "a" * 64
+    release_item["size_bytes"] = 10
+    release_item["completion"] = {
+      "evidence_version": 3,
+      "git_path": "release-completions/v3.1.0.json",
+      "git_commit": "d" * 40,
+      "zip_sha256": release_item["checksum"],
+      "manifest_path": "release-manifest.json",
+      "manifest_entry_sha256": plan.release_identity_sha256(release_item),
+      "verified": True,
+    }
+    metadata = {
+      "object_key": "kindow/release-state/v3.1.0/complete.json",
+      "release_date": "2024-01-01",
+      "checksum": "sha256:" + "c" * 64,
+      "size_bytes": 12,
+      "backup": {
+        "drive_object_key": "keyflowy/apps/kindow/release-state/v3.1.0/complete.json",
+        "sha256": "sha256:" + "c" * 64,
+        "size_bytes": 12,
+        "verified": True,
+      },
+      "completion": release_item["completion"],
+    }
+    manifest_path = path / "manifest.json"
+    manifest_path.write_text(json.dumps({
+      "schema_version": 1,
+      "product": "kindow",
+      "generated_at": "2026-08-26T00:00:00Z",
+      "releases": [release_item],
+    }), encoding="utf-8")
+    metadata_dir = path / "release-state-metadata"
+    version_dir = metadata_dir / "v3.1.0"
+    version_dir.mkdir(parents=True)
+    metadata_path = version_dir / "metadata.json"
+    metadata_path.write_text(json.dumps({
+      "schema_version": 1,
+      "version": "3.1.0",
+      "retention_metadata": [metadata],
+    }), encoding="utf-8")
+    inventory_path = path / "inventory.json"
+    inventory_path.write_text(json.dumps({
+      "objects": [inventory_item("3.1.0", 10, "old")],
+    }), encoding="utf-8")
+    retention_plan = plan.build_plan(
+      manifest_path,
+      POLICY,
+      inventory_path,
+      AS_OF,
+      REMOTE,
+      PREFIX,
+      retention_metadata_dir=metadata_dir,
+    )
+    plan_path = path / "retention-plan.json"
+    plan_path.write_text(json.dumps(retention_plan), encoding="utf-8")
+
+    metadata["size_bytes"] = 13
+    metadata_path.write_text(json.dumps({
+      "schema_version": 1,
+      "version": "3.1.0",
+      "retention_metadata": [metadata],
+    }), encoding="utf-8")
+
+    with patch("apply_plan.subprocess.run") as run:
+      code = apply_plan.main([
+        "--plan", str(plan_path),
+        "--expected-plan-sha256", retention_plan["plan_id"],
+        "--product", "kindow",
+        "--rclone-remote", REMOTE,
+        "--r2-prefix", PREFIX,
+        "--manifest", str(manifest_path),
+        "--retention-metadata-dir", str(metadata_dir),
+        "--now", "2026-08-26T00:00:00Z",
+        "--result-output", str(path / "apply-result.json"),
+      ])
+    self.assertEqual(code, 2)
+    run.assert_not_called()
+
   def test_rejects_an_invalid_manifest_before_contacting_rclone(self):
     path, retention_plan, plan_path, manifest_path = self.fixture()
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))

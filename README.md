@@ -37,6 +37,12 @@ Production products may opt into policy v2 with
 - limits each deterministic deletion batch and defers the remainder to the
   next scheduled plan.
 
+Remote evidence is checked only for the batched deletion candidates, not for
+every archived release. A candidate that fails verification is not deleted and
+does not fail the plan: it is moved to `keep` with reason
+`evidence-verification-failed` and reported in the plan's `evidence_failures`
+array, and its freed batch slot is not refilled until the next plan.
+
 The cutoff dates are inclusive. An object released exactly on a cutoff date is
 kept. A stable installer that is not notarized is kept for investigation and
 is never treated as a deletion candidate.
@@ -55,9 +61,12 @@ never receives rclone credentials as a secret. It is a planning workflow, not
 an apply workflow. Consumers should pin the shared workflow to a reviewed
 release tag once the repository's first release is published. Do not use a
 mutable branch for production callers.
-For policy v2 it also snapshots the current R2 appcast, verifies every declared
-archive and Drive backup from remote metadata (GitHub `digest`, Drive MD5 and
-size), and proves each Git completion commit is reachable from
+For policy v2 it also snapshots the current R2 appcast, pins one `AS_OF`
+timestamp, then runs three steps: a provisional plan that emits only the
+batched deletion candidates, a `verify_evidence.py` pass that checks those
+candidates from remote metadata (GitHub `digest`, Drive MD5 and size), and a
+final plan bound to the resulting candidate evidence. Completion verification
+proves each Git completion commit is reachable from
 `refs/remotes/origin/main`. It reads both the tombstone and release manifest at
 that commit, then binds their release identity and ZIP digest to the current
 manifest before producing a plan. Historical ZIPs are not downloaded during a
@@ -105,9 +114,35 @@ python3 scripts/release-retention/plan.py \
   --inventory r2-inventory.json \
   --rclone-remote cf_r2:keyflowy-apps/ \
   --r2-prefix kindow/ \
+  --retention-metadata-dir release-state-metadata \
   --as-of 2026-08-26T00:00:00Z \
   --output retention-plan.json
 ```
+
+A complete policy-v2 plan is built in two passes with the same pinned
+`--as-of`. The first pass writes only the batched deletion candidates; the
+verifier turns them into signed results; the second pass binds the evidence:
+
+```sh
+python3 scripts/release-retention/plan.py ... \
+  --candidates-output release-retention-candidates.json
+python3 scripts/release-retention/verify_evidence.py \
+  --manifest release-manifest.json \
+  --retention-metadata-dir release-state-metadata \
+  --candidates release-retention-candidates.json \
+  --repository . \
+  --github-repository Keyflowy/kindow \
+  --drive-remote gd_admin: \
+  --output release-retention-candidate-evidence.json
+python3 scripts/release-retention/plan.py ... \
+  --candidate-evidence release-retention-candidate-evidence.json \
+  --output retention-plan.json
+```
+
+The evidence document is bound to the plan by `as_of` and the manifest,
+retention-metadata, and inventory digests; a mismatch is an integrity error.
+Plans use contract version 3 (`contract_version: 3`, `planner_version: "3"`);
+apply accepts contract 3 only.
 
 ## Applying a reviewed plan
 
@@ -159,20 +194,35 @@ must stop planning instead of being interpreted as `fallback: false`.
 The planner also rejects unknown policy keys so a misspelled policy setting
 cannot coexist with a valid setting unnoticed.
 
-New release-state evidence must use completion `evidence_version: 2` and carry
-all of `git_path`, `git_commit`, `zip_sha256`, `manifest_path`,
-`manifest_entry_sha256`, and `verified: true`. The App writes that same object
-to the release entry and every associated `retention_metadata[].completion`.
+Release-state evidence uses completion `evidence_version: 3` and carries
+exactly `evidence_version`, `git_path`, `git_commit`, `zip_sha256`,
+`manifest_path`, `manifest_entry_sha256`, and `verified`. The App writes that
+same object to the release entry and every associated retention-metadata
+`completion`.
 The Git tombstone carries `evidence_version`, release ID/version,
-`sparkle_version`, `zip_sha256`, `manifest_path`, and
+`zip_sha256`, `manifest_path`, and
 `manifest_entry_sha256`. `git_commit` must be the full SHA of that tombstone
-commit on the App repository's `main` history. The canonical manifest entry
-digest is `sha256:` plus SHA-256 of the release object encoded as sorted,
-compact JSON after removing its top-level `completion` field. Excluding that
-field avoids a self-reference when the App records completion on the release
-entry. Missing `evidence_version` is accepted only for already-published legacy
-entries; those entries still undergo trusted-main, tombstone ZIP, and historical
-manifest checks, with bindings derived from the immutable commit.
+commit on the App repository's `main` history.
+
+`manifest_entry_sha256` binds the release's stable identity, not the whole
+mutable release entry. It is `sha256:` plus SHA-256 of a JSON object containing
+only the release's identity fields — `version`, `feature_line`,
+`release_date`, `channel`, `notarization_status`, `full_zip_object_key`,
+`checksum`, `size_bytes`, and `sparkle_delta_object_keys` — encoded as sorted,
+compact JSON. Backfilling `archive` evidence or the `completion` field itself
+therefore never invalidates a recorded completion, and verifying a completion
+compares the identity of the historical entry at the tombstone commit to the
+current identity, not the full historical entry. Evidence versions older than 3
+are rejected.
+
+Release-state metadata no longer lives inside `release-manifest.json`; each
+version's entries sit in `release-state-metadata/vX.Y.Z/metadata.json` files
+with `{"schema_version": 1, "version": "X.Y.Z", "retention_metadata": [...]}`.
+The file's `version` must match its directory, and every entry's `object_key`
+must embed the same `vX.Y.Z` tag, so one file can only describe its own
+release. Pass the directory to every script with `--retention-metadata-dir`;
+the plan records a `retention_metadata_sha256` digest of the loaded entries
+and apply rejects the plan when any file changed after planning.
 
 An abbreviated release looks like this:
 
@@ -217,6 +267,7 @@ The tests use only Python's standard `unittest` library:
 python3 -m unittest discover -s tests -v
 ```
 
-The tests include v1 compatibility, archive-evidence gating, live appcast
-protection, release metadata evidence, cache exclusion, bounded batch
+The tests include v1 compatibility, identity-bound completion evidence, live
+appcast protection, per-version release-state metadata, candidate-only
+verification with skip-and-report, cache exclusion, bounded batch
 progression, apply idempotency, deterministic output, and schema parity.

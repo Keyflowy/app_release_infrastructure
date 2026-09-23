@@ -38,6 +38,11 @@ on:
         required: false
         type: string
         default: ""
+      retention_metadata_dir:
+        description: Optional directory of per-version release-state metadata files
+        required: false
+        type: string
+        default: ""
 jobs:
   plan:
     outputs:
@@ -136,20 +141,6 @@ jobs:
           echo "path=$inventory_path" >> "$GITHUB_OUTPUT"
           echo "complete=true" >> "$GITHUB_OUTPUT"
 
-      - name: Verify archive-backed retention metadata
-        if: ${{ inputs.rclone_remote != '' }}
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          python3 .release-infrastructure/scripts/release-retention/verify_evidence.py \
-            --manifest "${{ inputs.manifest }}" \
-            --repository "$GITHUB_WORKSPACE" \
-            --github-repository "$GITHUB_REPOSITORY" \
-            --drive-remote gd_admin: \
-            --rclone rclone \
-            --output "$RUNNER_TEMP/release-retention-archive-evidence.json"
-
       - name: Snapshot live appcast
         id: appcast
         if: ${{ inputs.rclone_remote != '' }}
@@ -179,16 +170,88 @@ jobs:
           test -s "$appcast_path"
           echo "path=$appcast_path" >> "$GITHUB_OUTPUT"
 
+      - name: Pin plan timestamp
+        id: as_of
+        env:
+          AS_OF_INPUT: ${{ inputs.as_of }}
+        run: |
+          set -euo pipefail
+          if [ -n "$AS_OF_INPUT" ]; then
+            echo "value=$AS_OF_INPUT" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build provisional deletion candidates
+        if: ${{ inputs.rclone_remote != '' }}
+        env:
+          MANIFEST_PATH: ${{ inputs.manifest }}
+          POLICY_PATH: ${{ inputs.policy }}
+          INVENTORY_PATH: ${{ steps.inventory.outputs.path }}
+          AS_OF: ${{ steps.as_of.outputs.value }}
+          RCLONE_REMOTE: ${{ inputs.rclone_remote }}
+          R2_PREFIX: ${{ inputs.r2_prefix }}
+          APPCAST_PATH: ${{ steps.appcast.outputs.path }}
+          RETENTION_METADATA_DIR: ${{ inputs.retention_metadata_dir }}
+        run: |
+          set -euo pipefail
+
+          args=(
+            --manifest "$MANIFEST_PATH"
+            --policy "$POLICY_PATH"
+            --as-of "$AS_OF"
+            --inventory "$INVENTORY_PATH"
+            --rclone-remote "$RCLONE_REMOTE"
+            --r2-prefix "$R2_PREFIX"
+            --candidates-output "$RUNNER_TEMP/release-retention-candidates.json"
+          )
+
+          if [ -n "$APPCAST_PATH" ]; then
+            args+=(--appcast "$APPCAST_PATH")
+          fi
+
+          if [ -n "$RETENTION_METADATA_DIR" ]; then
+            args+=(--retention-metadata-dir "$RETENTION_METADATA_DIR")
+          fi
+
+          python3 .release-infrastructure/scripts/release-retention/plan.py "${args[@]}"
+
+      - name: Verify deletion candidates
+        if: ${{ inputs.rclone_remote != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MANIFEST_PATH: ${{ inputs.manifest }}
+          RETENTION_METADATA_DIR: ${{ inputs.retention_metadata_dir }}
+        run: |
+          set -euo pipefail
+
+          args=(
+            --manifest "$MANIFEST_PATH"
+            --repository "$GITHUB_WORKSPACE"
+            --github-repository "$GITHUB_REPOSITORY"
+            --drive-remote gd_admin:
+            --rclone rclone
+            --candidates "$RUNNER_TEMP/release-retention-candidates.json"
+            --output "$RUNNER_TEMP/release-retention-candidate-evidence.json"
+          )
+
+          if [ -n "$RETENTION_METADATA_DIR" ]; then
+            args+=(--retention-metadata-dir "$RETENTION_METADATA_DIR")
+          fi
+
+          python3 .release-infrastructure/scripts/release-retention/verify_evidence.py "${args[@]}"
+
       - name: Build deterministic retention plan
         env:
           MANIFEST_PATH: ${{ inputs.manifest }}
           POLICY_PATH: ${{ inputs.policy }}
           INVENTORY_PATH: ${{ steps.inventory.outputs.path }}
-          AS_OF: ${{ inputs.as_of }}
+          AS_OF: ${{ steps.as_of.outputs.value }}
           RCLONE_REMOTE: ${{ inputs.rclone_remote }}
           R2_PREFIX: ${{ inputs.r2_prefix }}
           APPCAST_PATH: ${{ steps.appcast.outputs.path }}
-          ARCHIVE_EVIDENCE_PATH: ${{ runner.temp }}/release-retention-archive-evidence.json
+          RETENTION_METADATA_DIR: ${{ inputs.retention_metadata_dir }}
+          CANDIDATE_EVIDENCE_PATH: ${{ runner.temp }}/release-retention-candidate-evidence.json
         run: |
           set -euo pipefail
 
@@ -197,14 +260,11 @@ jobs:
             --policy "$POLICY_PATH"
             --format json
             --output retention-plan.json
+            --as-of "$AS_OF"
           )
 
           if [ -n "$INVENTORY_PATH" ]; then
             args+=(--inventory "$INVENTORY_PATH")
-          fi
-
-          if [ -n "$AS_OF" ]; then
-            args+=(--as-of "$AS_OF")
           fi
 
           if [ -n "$RCLONE_REMOTE" ]; then
@@ -215,8 +275,12 @@ jobs:
             args+=(--appcast "$APPCAST_PATH")
           fi
 
-          if [ -f "$ARCHIVE_EVIDENCE_PATH" ]; then
-            args+=(--archive-evidence "$ARCHIVE_EVIDENCE_PATH")
+          if [ -f "$CANDIDATE_EVIDENCE_PATH" ]; then
+            args+=(--candidate-evidence "$CANDIDATE_EVIDENCE_PATH")
+          fi
+
+          if [ -n "$RETENTION_METADATA_DIR" ]; then
+            args+=(--retention-metadata-dir "$RETENTION_METADATA_DIR")
           fi
 
           python3 .release-infrastructure/scripts/release-retention/plan.py "${args[@]}"
